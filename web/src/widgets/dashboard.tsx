@@ -2397,10 +2397,11 @@ export const DashboardWidget: React.FC = () => {
   
   // Handler to toggle fullscreen mode (for standalone app, just update local state)
   const handleToggleFullscreen = async () => {
-    const newMode = displayMode === 'fullscreen' ? 'inline' : 'fullscreen';
-    window.displayMode = newMode;
-    // Trigger re-render by updating a state if needed
-    // For now, just update window directly
+    try {
+      const newMode = displayMode === 'fullscreen' ? 'inline' : 'fullscreen';
+      window.displayMode = newMode;
+      // Trigger re-render by updating a state if needed
+      // For now, just update window directly
     } catch (error) {
       console.error('Error requesting display mode:', error);
     }

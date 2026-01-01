@@ -12,8 +12,8 @@ from typing import Dict, Any, List
 # Add parent directory to path
 sys.path.insert(0, '.')
 
-from app.tools.fetch_categorization_preferences import fetch_categorization_preferences_handler
-from app.tools.save_categorization_preference import save_categorization_preferences_handler
+from app.tools.fetch_preferences import fetch_preferences_handler
+from app.tools.save_preferences import save_preferences_handler
 from app.database import SessionLocal, CategorizationPreference, resolve_user_id
 
 
@@ -126,11 +126,12 @@ async def run_test(test_name: str, tool_name: str, func, *args, **kwargs):
 
 async def tc1_fetch_empty():
     """TC1: Fetch Empty Preferences"""
+    global finding_id_counter
     clean_database()
     result = await run_test(
         "TC1",
         "fetch_categorization_preferences",
-        fetch_categorization_preferences_handler,
+        fetch_preferences_handler,
         user_id=None
     )
     
@@ -153,13 +154,14 @@ async def tc1_fetch_empty():
 
 async def tc2_save_single():
     """TC2: Save Single Preference"""
+    global finding_id_counter
     clean_database()
     
     # Save
     save_result = await run_test(
         "TC2-Save",
         "save_categorization_preferences",
-        save_categorization_preferences_handler,
+        save_preferences_handler,
         preferences=[{
             "name": "Netflix to Entertainment",
             "rule": {
@@ -190,7 +192,7 @@ async def tc2_save_single():
     fetch_result = await run_test(
         "TC2-Fetch",
         "fetch_categorization_preferences",
-        fetch_categorization_preferences_handler,
+        fetch_preferences_handler,
         user_id=None
     )
     
@@ -214,6 +216,7 @@ async def tc2_save_single():
 
 async def tc3_save_multiple():
     """TC3: Save Multiple Preferences"""
+    global finding_id_counter
     clean_database()
     
     prefs_to_save = [
@@ -225,7 +228,7 @@ async def tc3_save_multiple():
     save_result = await run_test(
         "TC3-Save",
         "save_categorization_preferences",
-        save_categorization_preferences_handler,
+        save_preferences_handler,
         preferences=prefs_to_save,
         user_id=None
     )
@@ -251,7 +254,7 @@ async def tc3_save_multiple():
     fetch_result = await run_test(
         "TC3-Fetch",
         "fetch_categorization_preferences",
-        fetch_categorization_preferences_handler,
+        fetch_preferences_handler,
         user_id=None
     )
     
@@ -289,10 +292,11 @@ async def tc3_save_multiple():
 
 async def tc4_update_existing():
     """TC4: Update Existing Preference"""
+    global finding_id_counter
     clean_database()
     
     # Save initial preference
-    await save_categorization_preferences_handler(
+    await save_preferences_handler(
         preferences=[{
             "name": "Uber",
             "rule": {
@@ -304,7 +308,7 @@ async def tc4_update_existing():
     )
     
     # Fetch to get ID
-    fetch1 = await fetch_categorization_preferences_handler(user_id=None)
+    fetch1 = await fetch_preferences_handler(user_id=None)
     pref_id = None
     if fetch1 and "structuredContent" in fetch1:
         prefs = fetch1["structuredContent"].get("preferences", [])
@@ -329,7 +333,7 @@ async def tc4_update_existing():
     update_result = await run_test(
         "TC4-Update",
         "save_categorization_preferences",
-        save_categorization_preferences_handler,
+        save_preferences_handler,
         preferences=[{
             "preference_id": pref_id,
             "name": "Uber",
@@ -359,7 +363,7 @@ async def tc4_update_existing():
             finding_id_counter += 1
     
     # Verify update
-    fetch2 = await fetch_categorization_preferences_handler(user_id=None)
+    fetch2 = await fetch_preferences_handler(user_id=None)
     if fetch2 and "structuredContent" in fetch2:
         prefs = fetch2["structuredContent"].get("preferences", [])
         if len(prefs) == 1 and prefs[0]["rule"]["category"] == "Shopping":
@@ -379,12 +383,13 @@ async def tc4_update_existing():
 
 async def tc5_invalid_category():
     """TC5: Invalid Category in Preference"""
+    global finding_id_counter
     clean_database()
     
     result = await run_test(
         "TC5",
         "save_categorization_preferences",
-        save_categorization_preferences_handler,
+        save_preferences_handler,
         preferences=[{
             "name": "Test",
             "rule": {
@@ -427,13 +432,14 @@ async def tc5_invalid_category():
 
 async def tc6_missing_fields():
     """TC6: Missing Required Fields"""
+    global finding_id_counter
     clean_database()
     
     # Test missing name
     result1 = await run_test(
         "TC6-NoName",
         "save_categorization_preferences",
-        save_categorization_preferences_handler,
+        save_preferences_handler,
         preferences=[{
             "rule": {
                 "conditions": {"merchant": "TEST"},
@@ -465,7 +471,7 @@ async def tc6_missing_fields():
     result2 = await run_test(
         "TC6-NoRule",
         "save_categorization_preferences",
-        save_categorization_preferences_handler,
+        save_preferences_handler,
         preferences=[{
             "name": "Test"
         }],
@@ -494,7 +500,7 @@ async def tc6_missing_fields():
     result3 = await run_test(
         "TC6-NoConditions",
         "save_categorization_preferences",
-        save_categorization_preferences_handler,
+        save_preferences_handler,
         preferences=[{
             "name": "Test",
             "rule": {
@@ -521,7 +527,7 @@ async def tc7_bank_specific():
     save_result = await run_test(
         "TC7-Save",
         "save_categorization_preferences",
-        save_categorization_preferences_handler,
+        save_preferences_handler,
         preferences=[{
             "name": "Chase Specific Rule",
             "rule": {
@@ -550,7 +556,7 @@ async def tc7_bank_specific():
             finding_id_counter += 1
     
     # Fetch and verify bank association
-    fetch_result = await fetch_categorization_preferences_handler(user_id=None)
+    fetch_result = await fetch_preferences_handler(user_id=None)
     if fetch_result and "structuredContent" in fetch_result:
         prefs = fetch_result["structuredContent"].get("preferences", [])
         bank_prefs = [p for p in prefs if p.get("bank_name") == "Chase"]
@@ -571,10 +577,11 @@ async def tc7_bank_specific():
 
 async def tc8_case_sensitivity():
     """TC8: Case Sensitivity"""
+    global finding_id_counter
     clean_database()
     
     # Save with lowercase
-    await save_categorization_preferences_handler(
+    await save_preferences_handler(
         preferences=[{
             "name": "Lowercase Test",
             "rule": {
@@ -586,7 +593,7 @@ async def tc8_case_sensitivity():
     )
     
     # Fetch and check
-    fetch_result = await fetch_categorization_preferences_handler(user_id=None)
+    fetch_result = await fetch_preferences_handler(user_id=None)
     if fetch_result and "structuredContent" in fetch_result:
         prefs = fetch_result["structuredContent"].get("preferences", [])
         if prefs:
@@ -598,6 +605,7 @@ async def tc8_case_sensitivity():
 
 async def tc9_special_characters():
     """TC9: Special Characters in Merchant"""
+    global finding_id_counter
     clean_database()
     
     special_merchants = ["MCDONALD'S", "AT&T", "7-ELEVEN"]
@@ -605,7 +613,7 @@ async def tc9_special_characters():
     save_result = await run_test(
         "TC9",
         "save_categorization_preferences",
-        save_categorization_preferences_handler,
+        save_preferences_handler,
         preferences=[
             {
                 "name": f"Test {m}",
@@ -639,6 +647,7 @@ async def tc9_special_characters():
 
 async def tc10_long_merchant_name():
     """TC10: Long Merchant Name"""
+    global finding_id_counter
     clean_database()
     
     long_name = "A" * 150  # 150 characters
@@ -646,7 +655,7 @@ async def tc10_long_merchant_name():
     result = await run_test(
         "TC10",
         "save_categorization_preferences",
-        save_categorization_preferences_handler,
+        save_preferences_handler,
         preferences=[{
             "name": "Long Merchant Test",
             "rule": {
@@ -678,12 +687,13 @@ async def tc10_long_merchant_name():
 
 async def tc11_empty_conditions():
     """TC11: Empty Conditions"""
+    global finding_id_counter
     clean_database()
     
     result = await run_test(
         "TC11",
         "save_categorization_preferences",
-        save_categorization_preferences_handler,
+        save_preferences_handler,
         preferences=[{
             "name": "Empty Conditions Test",
             "rule": {
@@ -704,10 +714,11 @@ async def tc11_empty_conditions():
 
 async def tc12_preference_ordering():
     """TC12: Preference Ordering"""
+    global finding_id_counter
     clean_database()
     
     # Save multiple preferences with different priorities
-    await save_categorization_preferences_handler(
+    await save_preferences_handler(
         preferences=[
             {"name": "Low Priority", "rule": {"conditions": {"merchant": "TEST"}, "category": "Other"}, "priority": 1},
             {"name": "High Priority", "rule": {"conditions": {"merchant": "TEST"}, "category": "Shopping"}, "priority": 10},
@@ -716,7 +727,7 @@ async def tc12_preference_ordering():
         user_id=None
     )
     
-    fetch_result = await fetch_categorization_preferences_handler(user_id=None)
+    fetch_result = await fetch_preferences_handler(user_id=None)
     if fetch_result and "structuredContent" in fetch_result:
         prefs = fetch_result["structuredContent"].get("preferences", [])
         if len(prefs) == 3:
