@@ -11,7 +11,8 @@ from collections import defaultdict
 from decimal import Decimal
 from typing import Any, Dict, Optional, List
 
-from app.database import SessionLocal, CategorySummary, StatementInsight, StatementPeriod, Budget, CategorizationPreference, resolve_user_id
+from app.database import SessionLocal, CategorySummary, StatementInsight, StatementPeriod, Budget, CategorizationPreference, Transaction, resolve_user_id
+from datetime import date
 from app.logger import create_logger, ErrorType
 from app.schemas.dashboard import (
     CoverageWindow,
@@ -41,6 +42,64 @@ def _decimal_to_float(value: Decimal | float | int | None) -> float:
     if isinstance(value, Decimal):
         return float(value)
     return float(value)
+
+
+def _aggregate_transactions_to_summaries(
+    transactions: List[Transaction],
+    user_id: str
+) -> List[CategorySummary]:
+    """
+    Aggregate transactions into CategorySummary-like objects for compatibility.
+    
+    This allows _build_dashboard_props to work with both Transaction and CategorySummary data.
+    
+    Args:
+        transactions: List of Transaction objects
+        user_id: User ID (for creating summary objects)
+    
+    Returns:
+        List of CategorySummary-like objects (using CategorySummary model structure)
+    """
+    from collections import defaultdict
+    
+    # Group by bank_name, month_year, category, profile
+    grouped = defaultdict(lambda: {
+        'amount': Decimal('0'),
+        'count': 0,
+        'currency': 'USD',
+        'profile': None
+    })
+    
+    for tx in transactions:
+        # Extract month_year from date
+        month_year = tx.date.strftime('%Y-%m')
+        key = (tx.bank_name, month_year, tx.category, tx.profile)
+        
+        grouped[key]['amount'] += Decimal(str(tx.amount))
+        grouped[key]['count'] += 1
+        grouped[key]['currency'] = tx.currency
+        grouped[key]['profile'] = tx.profile
+    
+    # Convert to CategorySummary-like objects
+    summaries = []
+    for (bank_name, month_year, category, profile), data in grouped.items():
+        # Create a minimal CategorySummary-like object
+        # We'll use a simple object that has the same attributes
+        class SummaryLike:
+            def __init__(self):
+                self.bank_name = bank_name
+                self.month_year = month_year
+                self.category = category
+                self.amount = data['amount']
+                self.currency = data['currency']
+                self.transaction_count = data['count']
+                self.profile = data['profile']
+                self.insights = None
+        
+        summary = SummaryLike()
+        summaries.append(summary)
+    
+    return summaries
 
 
 # ============================================================================
@@ -561,35 +620,73 @@ def get_financial_data_handler(
         })
 
         # =====================================================================
-        # FETCH DATA: All summaries for widget, filtered summaries for AI
+        # FETCH DATA: Try Transaction table first, fall back to CategorySummary
         # =====================================================================
         
-        # ALWAYS fetch ALL summaries for the widget (_meta payload)
-        # The widget receives full data and handles filtering client-side
-        all_summaries = db.query(CategorySummary).filter(
-            CategorySummary.user_id == resolved_user_id
+        # Try to fetch from Transaction table first
+        all_transactions = db.query(Transaction).filter(
+            Transaction.user_id == resolved_user_id
         ).all()
+        
+        # If we have transactions, aggregate them
+        if all_transactions:
+            logger.info("Using Transaction table for aggregation", {
+                "transaction_count": len(all_transactions)
+            })
+            all_summaries = _aggregate_transactions_to_summaries(all_transactions, resolved_user_id)
+            
+            # Apply filters to transactions before aggregation
+            filtered_transactions_query = db.query(Transaction).filter(
+                Transaction.user_id == resolved_user_id
+            )
+            if bank_name:
+                filtered_transactions_query = filtered_transactions_query.filter(Transaction.bank_name == bank_name)
+            if month_year:
+                # Filter by date range for the month
+                year, month = map(int, month_year.split('-'))
+                from calendar import monthrange
+                last_day = monthrange(year, month)[1]
+                date_from = date(year, month, 1)
+                date_to = date(year, month, last_day)
+                filtered_transactions_query = filtered_transactions_query.filter(
+                    Transaction.date >= date_from,
+                    Transaction.date <= date_to
+                )
+            if categories:
+                filtered_transactions_query = filtered_transactions_query.filter(Transaction.category.in_(categories))
+            if profile:
+                filtered_transactions_query = filtered_transactions_query.filter(Transaction.profile == profile)
+            
+            filtered_transactions = filtered_transactions_query.all()
+            filtered_summaries = _aggregate_transactions_to_summaries(filtered_transactions, resolved_user_id) if filtered_transactions else []
+        else:
+            # Fall back to CategorySummary table
+            logger.info("Falling back to CategorySummary table", {
+                "user_id": resolved_user_id
+            })
+            all_summaries = db.query(CategorySummary).filter(
+                CategorySummary.user_id == resolved_user_id
+            ).all()
+            
+            # Fetch FILTERED summaries for structuredContent (AI payload)
+            filtered_query = db.query(CategorySummary).filter(
+                CategorySummary.user_id == resolved_user_id
+            )
+            if bank_name:
+                filtered_query = filtered_query.filter(CategorySummary.bank_name == bank_name)
+            if month_year:
+                filtered_query = filtered_query.filter(CategorySummary.month_year == month_year)
+            if categories:
+                filtered_query = filtered_query.filter(CategorySummary.category.in_(categories))
+            if profile:
+                filtered_query = filtered_query.filter(CategorySummary.profile == profile)
+            filtered_summaries = filtered_query.all()
         
         # Collect available profiles from all summaries
         available_profiles = set()
         for s in all_summaries:
             if s.profile:
                 available_profiles.add(s.profile)
-        
-        # Fetch FILTERED summaries for structuredContent (AI payload)
-        # When AI requests a specific month/bank/profile, give it ONLY that data
-        filtered_query = db.query(CategorySummary).filter(
-            CategorySummary.user_id == resolved_user_id
-        )
-        if bank_name:
-            filtered_query = filtered_query.filter(CategorySummary.bank_name == bank_name)
-        if month_year:
-            filtered_query = filtered_query.filter(CategorySummary.month_year == month_year)
-        if categories:
-            filtered_query = filtered_query.filter(CategorySummary.category.in_(categories))
-        if profile:
-            filtered_query = filtered_query.filter(CategorySummary.profile == profile)
-        filtered_summaries = filtered_query.all()
         
         # Fetch ALL periods (unfiltered) for widget
         all_periods = db.query(StatementPeriod).filter(

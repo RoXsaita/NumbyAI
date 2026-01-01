@@ -8,6 +8,9 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import UUID as PostgresUUID
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from app.config import settings
+from app.logger import create_logger
+
+logger = create_logger("database")
 
 Base = declarative_base()
 
@@ -51,6 +54,8 @@ class User(Base):
     statement_periods = relationship("StatementPeriod", back_populates="user", cascade="all, delete-orphan")
     categorization_preferences = relationship("CategorizationPreference", back_populates="user", cascade="all, delete-orphan")
     budgets = relationship("Budget", back_populates="user", cascade="all, delete-orphan")
+    transactions = relationship("Transaction", back_populates="user", cascade="all, delete-orphan")
+    categorization_rules = relationship("CategorizationRule", back_populates="user", cascade="all, delete-orphan")
     # DEPRECATED: keeping for backward compatibility during migration
     parsing_instructions = relationship("ParsingInstruction", back_populates="user", cascade="all, delete-orphan")
     insights = relationship("Insight", back_populates="user", cascade="all, delete-orphan")
@@ -230,6 +235,58 @@ class Insight(Base):
     )
 
 
+class Transaction(Base):
+    """Transaction model - stores individual transaction records"""
+    __tablename__ = "transactions"
+
+    id = UUIDColumn()
+    user_id = UUIDForeignKey("users.id")
+    date = Column(Date, nullable=False, index=True)
+    description = Column(String(500), nullable=False)
+    merchant = Column(String(200), nullable=True, index=True)
+    amount = Column(Numeric(12, 2), nullable=False)  # Negative for expenses, positive for income
+    currency = Column(String(3), nullable=False)
+    category = Column(String(100), nullable=False, index=True)
+    bank_name = Column(String(100), nullable=False, index=True)
+    statement_period_id = UUIDForeignKey("statement_periods.id")
+    profile = Column(String(50), nullable=True, index=True)  # Household profile (e.g., "Me", "Partner", "Joint")
+    created_at = Column(DateTime, default=_utc_now, nullable=False)
+    updated_at = Column(DateTime, default=_utc_now, onupdate=_utc_now, nullable=False)
+
+    # Relationships
+    user = relationship("User", back_populates="transactions")
+    statement_period = relationship("StatementPeriod")
+
+    __table_args__ = (
+        Index("idx_transactions_user_date", "user_id", "date"),
+        Index("idx_transactions_user_category", "user_id", "category"),
+        Index("idx_transactions_user_merchant", "user_id", "merchant"),
+        Index("idx_transactions_user_bank_date", "user_id", "bank_name", "date"),
+    )
+
+
+class CategorizationRule(Base):
+    """Categorization rule model - stores learned merchant → category mappings"""
+    __tablename__ = "categorization_rules"
+
+    id = UUIDColumn()
+    user_id = UUIDForeignKey("users.id")
+    merchant_pattern = Column(String(200), nullable=False)  # Regex or exact match pattern
+    category = Column(String(100), nullable=False)
+    confidence_score = Column(Integer, default=1, nullable=False)  # Number of times matched
+    enabled = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=_utc_now, nullable=False)
+    updated_at = Column(DateTime, default=_utc_now, onupdate=_utc_now, nullable=False)
+
+    # Relationships
+    user = relationship("User", back_populates="categorization_rules")
+
+    __table_args__ = (
+        Index("idx_cat_rules_user_merchant", "user_id", "merchant_pattern"),
+        Index("idx_cat_rules_user_enabled", "user_id", "enabled"),
+    )
+
+
 # Database engine and session
 connect_args = {}
 if settings.database_url.startswith("sqlite"):
@@ -277,22 +334,27 @@ def get_or_create_test_user() -> str:
         db.close()
 
 
-def resolve_user_id(user_id: str | None = None) -> str:
+def resolve_user_id(user_id: str | None = None, require_auth: bool = False) -> str:
     """
-    Resolve and validate a user_id, falling back to test user if invalid or None.
+    Resolve and validate a user_id.
     
-    This prevents issues where the AI passes arbitrary strings like "test-user"
-    instead of valid UUIDs. If the provided user_id doesn't exist in the database,
-    we fall back to the test user.
+    For multi-user support: if require_auth is True, user_id must be provided and valid.
+    Otherwise, falls back to test user for development.
     
     Args:
         user_id: Optional user ID string to validate
+        require_auth: If True, user_id is required and must exist (no test user fallback)
         
     Returns:
-        str: Valid user ID (either the provided one if it exists, or test user ID)
+        str: Valid user ID
+        
+    Raises:
+        ValueError: If require_auth is True and user_id is None or invalid
     """
-    # If no user_id provided, use test user
+    # If no user_id provided
     if not user_id:
+        if require_auth:
+            raise ValueError("User ID is required but not provided")
         return get_or_create_test_user()
     
     user_id_str = str(user_id)
@@ -304,8 +366,11 @@ def resolve_user_id(user_id: str | None = None) -> str:
         if existing_user:
             return user_id_str
         else:
-            # User doesn't exist - fall back to test user
-            # This handles cases where AI passes arbitrary strings like "test-user"
+            # User doesn't exist
+            if require_auth:
+                raise ValueError(f"User ID {user_id_str} does not exist")
+            # Fall back to test user for development
+            logger.warn("User ID not found, falling back to test user", {"user_id": user_id_str})
             return get_or_create_test_user()
     finally:
         db.close()

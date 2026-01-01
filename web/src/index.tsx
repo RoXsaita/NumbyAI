@@ -1,10 +1,9 @@
-// Entry point for widget components
+// Entry point for NumbyAI standalone app
 import React from 'react';
 import { createRoot } from 'react-dom/client';
-import Dashboard from './components/Dashboard';
+import { App } from './App';
 
-// Mount dashboard component
-const dashboardRoot = document.getElementById('dashboard-root');
-if (dashboardRoot) {
-  createRoot(dashboardRoot).render(<Dashboard />);
-}
+// Mount app component
+const rootElement = document.getElementById('root') || document.body;
+const root = createRoot(rootElement);
+root.render(<App />);

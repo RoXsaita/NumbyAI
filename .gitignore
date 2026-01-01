@@ -39,6 +39,7 @@ build/
 *.swp
 *.swo
 *~
+docs/
 
 # OS
 .DS_Store
@@ -48,6 +49,10 @@ Thumbs.db
 *.db
 *.sqlite
 *.sqlite3
+
+# Uploads
+mcp-server/uploads/
+uploads/
 
 # Logs
 *.log

@@ -1,36 +1,20 @@
-import { useSyncExternalStore } from 'react';
-
-type OpenAiGlobals = Window['openai'];
-
 /**
- * Small helper hook that mirrors the Apps SDK example.
- * Lets components subscribe to host-provided globals such as theme or displayMode.
+ * DEPRECATED: This file is no longer needed after removing OpenAI Apps SDK.
+ * 
+ * For theme/display mode, use direct window access or a proper state management solution.
+ * 
+ * This file is kept for backward compatibility but should not be used in new code.
  */
-export function useOpenAiGlobal<K extends keyof OpenAiGlobals>(
-  key: K,
-  fallback: OpenAiGlobals[K] | null = null
-): OpenAiGlobals[K] | null {
-  return useSyncExternalStore(
-    (onChange) => {
-      if (typeof window === 'undefined' || !window.addEventListener) {
-        return () => {};
-      }
 
-      const handler = (event: Event) => {
-        const customEvent = event as CustomEvent<{ globals: Partial<OpenAiGlobals> }>;
-        if (customEvent.detail?.globals[key] !== undefined) {
-          onChange();
-        }
-      };
+// Simple theme hook replacement
+export function useTheme(): 'light' | 'dark' {
+  // Default to light theme for standalone app
+  return window.theme || 'light';
+}
 
-      window.addEventListener('openai:set_globals', handler as EventListener, {
-        passive: true,
-      });
-
-      return () => window.removeEventListener('openai:set_globals', handler as EventListener);
-    },
-    () => window.openai?.[key] ?? fallback,
-    () => window.openai?.[key] ?? fallback
-  );
+// Simple display mode hook replacement
+export function useDisplayMode(): 'pip' | 'inline' | 'fullscreen' {
+  // Default to fullscreen for standalone app
+  return window.displayMode || 'fullscreen';
 }
 

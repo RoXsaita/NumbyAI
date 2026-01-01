@@ -12,8 +12,13 @@ from urllib.parse import urlparse
 import mcp.types as types
 from mcp.types import TextContent
 from mcp.server.fastmcp import FastMCP
-from starlette.responses import JSONResponse, HTMLResponse
+from starlette.responses import JSONResponse, HTMLResponse, StreamingResponse
+from starlette.requests import Request
+from fastapi import UploadFile, File, Form
 from dotenv import load_dotenv
+import shutil
+from datetime import datetime
+import uuid
 
 from app.config import settings
 from app.logger import create_logger
@@ -34,6 +39,33 @@ from app.tools.tool_descriptions import (
     MUTATE_CATEGORIES_DESCRIPTION,
     SAVE_BUDGET_DESCRIPTION,
 )
+from app.services.cursor_agent_service import (
+    call_cursor_agent,
+    categorize_transactions_batch,
+    learn_merchant_rules
+)
+from app.services.statement_analyzer import (
+    check_existing_parsing_preferences,
+    analyze_statement_structure_from_file,
+    build_parsing_schema,
+    save_parsing_schema
+)
+from app.tools.statement_parser import (
+    parse_csv_statement,
+    extract_merchant,
+    normalize_transaction
+)
+from app.database import (
+    SessionLocal,
+    Transaction,
+    CategorizationRule,
+    User,
+    resolve_user_id,
+    get_or_create_test_user
+)
+from app.auth import oauth2_auth
+from jose import jwt
+from datetime import datetime, timedelta
 
 load_dotenv()
 
@@ -851,6 +883,456 @@ async def save_budget(
     if "structuredContent" not in result:
         raise ValueError("save_budget_handler missing structuredContent")
     return build_structured_call_result(result)
+
+
+# ============================================================================
+# REST API ENDPOINTS FOR STANDALONE WEB APP
+# ============================================================================
+
+# Create uploads directory if it doesn't exist
+UPLOADS_DIR = Path(__file__).parent.parent / "uploads"
+UPLOADS_DIR.mkdir(exist_ok=True)
+
+
+@mcp.custom_route("/api/chat/messages", methods=["POST"])
+async def send_chat_message(request: Request):
+    """Send message to AI chat, handle file uploads, trigger flows"""
+    try:
+        data = await request.json()
+        message = data.get("message", "")
+        file_data = data.get("file")  # Base64 encoded file or file ID
+        net_flow = data.get("net_flow")
+        user_id = data.get("user_id") or get_or_create_test_user()
+        
+        # TODO: Handle file uploads properly
+        # For now, return a simple response
+        return JSONResponse({
+            "message_id": str(uuid.uuid4()),
+            "response": "Chat functionality will be implemented with Cursor Agent integration"
+        })
+    except Exception as e:
+        logger.error("Chat message error", {"error": str(e)})
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/chat/stream", methods=["GET"])
+async def stream_chat_response(request: Request):
+    """Server-Sent Events endpoint for streaming AI responses"""
+    message_id = request.query_params.get("message_id")
+    
+    async def generate():
+        # TODO: Implement SSE streaming with Cursor Agent
+        yield f"data: {json.dumps({'type': 'message', 'content': 'Streaming not yet implemented'})}\n\n"
+    
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+@mcp.custom_route("/api/statements/upload", methods=["POST"])
+async def upload_statement(
+    request: Request,
+    file: UploadFile = File(...),
+    net_flow: float = Form(None),
+    bank_name: str = Form(None)
+):
+    """Upload and parse bank statement (CSV/Excel)"""
+    try:
+        user_id = get_or_create_test_user()  # TODO: Get from auth
+        
+        # Save file temporarily
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        user_upload_dir = UPLOADS_DIR / user_id
+        user_upload_dir.mkdir(exist_ok=True)
+        
+        file_path = user_upload_dir / f"{timestamp}_{file.filename}"
+        
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        
+        logger.info("File uploaded", {
+            "filename": file.filename,
+            "path": str(file_path),
+            "user_id": user_id
+        })
+        
+        # Check for existing parsing preferences
+        if bank_name:
+            existing_schema = check_existing_parsing_preferences(bank_name, user_id)
+            if existing_schema:
+                # Parse directly using existing schema
+                transactions = parse_csv_statement(str(file_path), existing_schema)
+                return JSONResponse({
+                    "job_id": str(uuid.uuid4()),
+                    "status": "parsed",
+                    "transactions_count": len(transactions),
+                    "transactions": transactions[:10]  # Return first 10 for preview
+                })
+        
+        # Analyze statement structure
+        analysis = analyze_statement_structure_from_file(str(file_path), user_id)
+        
+        return JSONResponse({
+            "job_id": str(uuid.uuid4()),
+            "status": "analysis_required",
+            "analysis": analysis,
+            "file_path": str(file_path)
+        })
+        
+    except Exception as e:
+        logger.error("File upload error", {"error": str(e)})
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/transactions", methods=["GET"])
+async def get_transactions(request: Request):
+    """List transactions with filters"""
+    try:
+        user_id = get_or_create_test_user()  # TODO: Get from auth
+        db = SessionLocal()
+        
+        query = db.query(Transaction).filter(Transaction.user_id == user_id)
+        
+        # Apply filters
+        bank_name = request.query_params.get("bank_name")
+        category = request.query_params.get("category")
+        date_from = request.query_params.get("date_from")
+        date_to = request.query_params.get("date_to")
+        
+        if bank_name:
+            query = query.filter(Transaction.bank_name == bank_name)
+        if category:
+            query = query.filter(Transaction.category == category)
+        if date_from:
+            query = query.filter(Transaction.date >= datetime.fromisoformat(date_from).date())
+        if date_to:
+            query = query.filter(Transaction.date <= datetime.fromisoformat(date_to).date())
+        
+        transactions = query.order_by(Transaction.date.desc()).limit(1000).all()
+        
+        result = [{
+            "id": str(tx.id),
+            "date": tx.date.isoformat(),
+            "description": tx.description,
+            "merchant": tx.merchant,
+            "amount": float(tx.amount),
+            "currency": tx.currency,
+            "category": tx.category,
+            "bank_name": tx.bank_name,
+            "profile": tx.profile
+        } for tx in transactions]
+        
+        db.close()
+        return JSONResponse({"transactions": result, "count": len(result)})
+        
+    except Exception as e:
+        logger.error("Get transactions error", {"error": str(e)})
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/transactions", methods=["PATCH"])
+async def update_transaction(request: Request):
+    """Update transaction (especially category)"""
+    try:
+        user_id = get_or_create_test_user()  # TODO: Get from auth
+        data = await request.json()
+        transaction_id = data.get("id")
+        updates = data.get("updates", {})
+        
+        db = SessionLocal()
+        tx = db.query(Transaction).filter(
+            Transaction.id == transaction_id,
+            Transaction.user_id == user_id
+        ).first()
+        
+        if not tx:
+            db.close()
+            return JSONResponse({"error": "Transaction not found"}, status_code=404)
+        
+        # Update fields
+        if "category" in updates:
+            tx.category = updates["category"]
+        if "merchant" in updates:
+            tx.merchant = updates["merchant"]
+        if "description" in updates:
+            tx.description = updates["description"]
+        
+        tx.updated_at = datetime.now()
+        db.commit()
+        db.close()
+        
+        return JSONResponse({
+            "id": str(tx.id),
+            "category": tx.category,
+            "updated": True
+        })
+        
+    except Exception as e:
+        logger.error("Update transaction error", {"error": str(e)})
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/financial-data", methods=["GET"])
+async def get_financial_data_api(request: Request):
+    """REST version of get_financial_data MCP tool"""
+    try:
+        user_id = get_or_create_test_user()  # TODO: Get from auth
+        
+        # Get filters from query params
+        bank_name = request.query_params.get("bank_name")
+        month_year = request.query_params.get("month_year")
+        categories = request.query_params.getlist("categories")
+        profile = request.query_params.get("profile")
+        
+        # Call existing handler
+        result = get_financial_data_handler(
+            user_id=user_id,
+            bank_name=bank_name,
+            month_year=month_year,
+            categories=categories if categories else None,
+            profile=profile
+        )
+        
+        # Return the _meta payload (full dashboard data)
+        return JSONResponse(result.get("_meta", result.get("structuredContent", {})))
+        
+    except Exception as e:
+        logger.error("Get financial data error", {"error": str(e)})
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/budgets", methods=["GET", "POST"])
+async def manage_budgets(request: Request):
+    """Get or save budgets"""
+    try:
+        user_id = get_or_create_test_user()  # TODO: Get from auth
+        
+        if request.method == "GET":
+            # Return existing budgets
+            from app.database import Budget
+            db = SessionLocal()
+            budgets = db.query(Budget).filter(Budget.user_id == user_id).all()
+            result = [{
+                "category": b.category,
+                "month_year": b.month_year,
+                "amount": float(b.amount),
+                "currency": b.currency
+            } for b in budgets]
+            db.close()
+            return JSONResponse({"budgets": result})
+        
+        elif request.method == "POST":
+            # Save budgets
+            data = await request.json()
+            budgets = data.get("budgets", [])
+            result = await save_budget_handler(budgets=budgets, user_id=user_id)
+            return JSONResponse(result.get("structuredContent", {"status": "saved"}))
+            
+    except Exception as e:
+        logger.error("Manage budgets error", {"error": str(e)})
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/preferences", methods=["GET", "POST"])
+async def manage_preferences_api(request: Request):
+    """Get or save preferences (categorization or parsing)"""
+    try:
+        user_id = get_or_create_test_user()  # TODO: Get from auth
+        
+        if request.method == "GET":
+            preference_type = request.query_params.get("preference_type", "categorization")
+            bank_name = request.query_params.get("bank_name")
+            
+            result = await fetch_preferences_handler(
+                preference_type=preference_type,
+                bank_name=bank_name,
+                user_id=user_id
+            )
+            
+            return JSONResponse(result.get("structuredContent", {}))
+        
+        elif request.method == "POST":
+            data = await request.json()
+            preferences = data.get("preferences", [])
+            preference_type = data.get("preference_type", "categorization")
+            
+            result = await save_preferences_handler(
+                preferences=preferences,
+                preference_type=preference_type,
+                user_id=user_id
+            )
+            
+            return JSONResponse(result.get("structuredContent", {"status": "saved"}))
+        
+    except Exception as e:
+        logger.error("Preferences API error", {"error": str(e)})
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/auth/register", methods=["POST"])
+async def register(request: Request):
+    """Register a new user"""
+    try:
+        data = await request.json()
+        email = data.get("email")
+        name = data.get("name")
+        password = data.get("password")  # TODO: Hash password properly
+        
+        if not email:
+            return JSONResponse({"error": "Email is required"}, status_code=400)
+        
+        db = SessionLocal()
+        try:
+            # Check if user exists
+            existing = db.query(User).filter(User.email == email).first()
+            if existing:
+                return JSONResponse({"error": "User already exists"}, status_code=400)
+            
+            # Create new user
+            user = User(email=email, name=name or email.split("@")[0])
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+            
+            # Generate JWT token
+            token = jwt.encode(
+                {"sub": str(user.id), "email": user.email, "exp": datetime.utcnow() + timedelta(days=30)},
+                settings.secret_key,
+                algorithm="HS256"
+            )
+            
+            return JSONResponse({
+                "user": {
+                    "id": str(user.id),
+                    "email": user.email,
+                    "name": user.name
+                },
+                "token": token
+            })
+        finally:
+            db.close()
+            
+    except Exception as e:
+        logger.error("Registration error", {"error": str(e)})
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/auth/login", methods=["POST"])
+async def login(request: Request):
+    """Login user (for local auth, OAuth2 handled separately)"""
+    try:
+        data = await request.json()
+        email = data.get("email")
+        password = data.get("password")  # TODO: Verify password properly
+        
+        if not email:
+            return JSONResponse({"error": "Email is required"}, status_code=400)
+        
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter(User.email == email).first()
+            if not user:
+                return JSONResponse({"error": "Invalid credentials"}, status_code=401)
+            
+            # TODO: Verify password hash
+            # For now, allow login without password verification (development only)
+            
+            # Generate JWT token
+            token = jwt.encode(
+                {"sub": str(user.id), "email": user.email, "exp": datetime.utcnow() + timedelta(days=30)},
+                settings.secret_key,
+                algorithm="HS256"
+            )
+            
+            return JSONResponse({
+                "user": {
+                    "id": str(user.id),
+                    "email": user.email,
+                    "name": user.name
+                },
+                "token": token
+            })
+        finally:
+            db.close()
+            
+    except Exception as e:
+        logger.error("Login error", {"error": str(e)})
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/auth/me", methods=["GET"])
+async def get_current_user(request: Request):
+    """Get current user from token"""
+    try:
+        # Try OAuth2 first
+        authorization = request.headers.get("Authorization")
+        token_payload = await oauth2_auth.validate_token(authorization)
+        
+        if token_payload:
+            # OAuth2 token
+            user_id = token_payload.get("sub")
+            db = SessionLocal()
+            try:
+                user = db.query(User).filter(User.id == user_id).first()
+                if user:
+                    return JSONResponse({
+                        "id": str(user.id),
+                        "email": user.email,
+                        "name": user.name
+                    })
+            finally:
+                db.close()
+        
+        # Try JWT token
+        if authorization and authorization.startswith("Bearer "):
+            token = authorization.split(" ")[1]
+            try:
+                payload = jwt.decode(token, settings.secret_key, algorithms=["HS256"])
+                user_id = payload.get("sub")
+                db = SessionLocal()
+                try:
+                    user = db.query(User).filter(User.id == user_id).first()
+                    if user:
+                        return JSONResponse({
+                            "id": str(user.id),
+                            "email": user.email,
+                            "name": user.name
+                        })
+                finally:
+                    db.close()
+            except jwt.JWTError:
+                pass
+        
+        # Fallback to test user for development
+        user_id = get_or_create_test_user()
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter(User.id == user_id).first()
+            if user:
+                return JSONResponse({
+                    "id": str(user.id),
+                    "email": user.email,
+                    "name": user.name
+                })
+        finally:
+            db.close()
+        
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+        
+    except Exception as e:
+        logger.error("Get current user error", {"error": str(e)})
+        # Fallback to test user for development
+        user_id = get_or_create_test_user()
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter(User.id == user_id).first()
+            if user:
+                return JSONResponse({
+                    "id": str(user.id),
+                    "email": user.email,
+                    "name": user.name
+                })
+        finally:
+            db.close()
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 # Get the ASGI app from FastMCP

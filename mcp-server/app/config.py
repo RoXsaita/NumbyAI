@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     # CORS - comma-separated list of allowed origins
     allowed_origins: str = "https://chatgpt.com"
     
+    # Cursor Agent integration
+    cursor_api_key: Optional[str] = None  # Optional, for headless mode
+    cursor_agent_path: str = "cursor-agent"  # Default: "cursor-agent", can be full path
+    
     class Config:
         env_file = ".env"
         case_sensitive = False

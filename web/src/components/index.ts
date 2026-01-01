@@ -31,3 +31,8 @@ export type { QuestHelpModalProps } from './QuestHelpModal';
 // Error boundary (existing)
 export { ErrorBoundary } from './ErrorBoundary';
 
+// Chat interface components
+export { ChatInterface } from './ChatInterface';
+export type { Message } from './ChatInterface';
+export { ChatMessage } from './ChatMessage';
+
