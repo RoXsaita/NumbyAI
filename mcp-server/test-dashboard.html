@@ -1,0 +1,57 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Finance Dashboard Test</title>
+  <script src="https://cdn.jsdelivr.net/npm/vega@5.28.0/build/vega.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/vega-lite@5.18.0/build/vega-lite.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/vega-embed@6.24.0/build/vega-embed.min.js"></script>
+  <script>
+    // Log when Vega libraries are loaded
+    window.addEventListener('DOMContentLoaded', () => {
+      console.log('DOM loaded');
+      console.log('window.vega:', typeof window.vega);
+      console.log('window.vegaLite:', typeof window.vegaLite);
+      console.log('window.vegaEmbed:', typeof window.vegaEmbed);
+    });
+  </script>
+</head>
+<body>
+  <h1>Vega Libraries Test</h1>
+  <div id="test-chart"></div>
+  
+  <script>
+    // Test chart rendering immediately
+    console.log('Script executing...');
+    console.log('window.vega:', typeof window.vega);
+    console.log('window.vegaLite:', typeof window.vegaLite);
+    console.log('window.vegaEmbed:', typeof window.vegaEmbed);
+    
+    if (typeof window.vegaEmbed !== 'undefined') {
+      const spec = {
+        "width": 400,
+        "height": 200,
+        "data": {"values": [
+          {"x": "A", "y": 10},
+          {"x": "B", "y": 20},
+          {"x": "C", "y": 15}
+        ]},
+        "mark": "bar",
+        "encoding": {
+          "x": {"field": "x", "type": "nominal"},
+          "y": {"field": "y", "type": "quantitative"}
+        }
+      };
+      
+      window.vegaEmbed('#test-chart', spec).then(() => {
+        console.log('Chart rendered successfully!');
+      }).catch(err => {
+        console.error('Error rendering chart:', err);
+      });
+    } else {
+      document.getElementById('test-chart').innerHTML = '<p style="color: red;">ERROR: vegaEmbed not available</p>';
+    }
+  </script>
+</body>
+</html>
+

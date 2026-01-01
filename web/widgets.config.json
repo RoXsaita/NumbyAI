@@ -1,0 +1,10 @@
+[
+  {
+    "name": "dashboard",
+    "entry": "dashboard",
+    "root_id": "dashboard-root",
+    "title": "Finance dashboard",
+    "description": "Interactive monthly finance dashboard for a saved bank statement."
+  }
+]
+

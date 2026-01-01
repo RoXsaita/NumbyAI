@@ -1,0 +1,98 @@
+{
+  "executor": "tool-mutate-categories",
+  "run_id": "20251212_161502",
+  "timestamp": "2025-12-12T13:19:25.469703+00:00",
+  "test_results": [
+    {
+      "case": "TC1",
+      "status": "pass",
+      "operation_summary": "Transfer Shopping -> Food & Groceries",
+      "zero_sum_maintained": true,
+      "notes": ""
+    },
+    {
+      "case": "TC2",
+      "status": "error",
+      "operation_summary": "Transfer from NonExistentCategory -> Food & Groceries",
+      "zero_sum_maintained": true,
+      "notes": ""
+    },
+    {
+      "case": "TC3",
+      "status": "error",
+      "operation_summary": "Transfer with negative amount",
+      "zero_sum_maintained": true,
+      "notes": ""
+    },
+    {
+      "case": "TC4",
+      "status": "pass",
+      "operation_summary": "Transfer amount exceeds source (300 > 200)",
+      "zero_sum_maintained": true,
+      "notes": ""
+    },
+    {
+      "case": "TC5",
+      "status": "pass",
+      "operation_summary": "Edit Income category to 5500",
+      "zero_sum_maintained": true,
+      "notes": ""
+    },
+    {
+      "case": "TC6",
+      "status": "pass",
+      "operation_summary": "Edit non-existent category",
+      "zero_sum_maintained": true,
+      "notes": ""
+    },
+    {
+      "case": "TC7",
+      "status": "pass",
+      "operation_summary": "Transfer + Edit operations",
+      "zero_sum_maintained": true,
+      "notes": ""
+    },
+    {
+      "case": "TC8",
+      "status": "pass",
+      "operation_summary": "Empty operations array",
+      "zero_sum_maintained": true,
+      "notes": ""
+    },
+    {
+      "case": "TC9",
+      "status": "error",
+      "operation_summary": "Invalid operation type 'delete'",
+      "zero_sum_maintained": true,
+      "notes": ""
+    },
+    {
+      "case": "TC10",
+      "status": "pass",
+      "operation_summary": "Transfer with month/bank filters",
+      "zero_sum_maintained": true,
+      "notes": ""
+    },
+    {
+      "case": "TC11",
+      "status": "pass",
+      "operation_summary": "Verify response structure",
+      "zero_sum_maintained": true,
+      "notes": ""
+    }
+  ],
+  "operation_coverage": {
+    "transfer_tested": true,
+    "edit_tested": true,
+    "multiple_ops_tested": true,
+    "error_handling_tested": true
+  },
+  "findings": [],
+  "summary": {
+    "total_tests": 11,
+    "passed": 8,
+    "failed": 0,
+    "errors": 3
+  },
+  "checklist_complete": true
+}

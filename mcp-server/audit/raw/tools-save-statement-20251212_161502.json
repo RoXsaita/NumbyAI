@@ -1,0 +1,112 @@
+{
+  "executor": "tool-save-statement",
+  "run_id": "20251212_161502",
+  "timestamp": "2025-12-12T13:17:52.897191+00:00",
+  "test_results": [
+    {
+      "case": "TC1",
+      "status": "pass",
+      "parameters_summary": "Valid reconciled data",
+      "response_summary": "Saved 3 summaries",
+      "notes": ""
+    },
+    {
+      "case": "TC2",
+      "status": "fail",
+      "parameters_summary": "Category totals: 2000, statement_net_flow: 5000 (150% mismatch)",
+      "response_summary": "RECONCILIATION ERROR: 60.0% diff",
+      "notes": ""
+    },
+    {
+      "case": "TC3",
+      "status": "pass",
+      "parameters_summary": "Category totals: 3000, statement_net_flow: 3072 (2.4% mismatch)",
+      "response_summary": "Saved 2 summaries",
+      "notes": ""
+    },
+    {
+      "case": "TC4",
+      "status": "fail",
+      "parameters_summary": "Category totals: 3000, statement_net_flow: 3078 (2.6% mismatch)",
+      "response_summary": "RECONCILIATION ERROR: 2.5% diff",
+      "notes": ""
+    },
+    {
+      "case": "TC5",
+      "status": "fail",
+      "parameters_summary": "Invalid category name",
+      "response_summary": "Error: Invalid category: InvalidCategory123",
+      "notes": ""
+    },
+    {
+      "case": "TC6",
+      "status": "fail",
+      "parameters_summary": "Empty category summaries array",
+      "response_summary": "Error: No category summaries provided",
+      "notes": ""
+    },
+    {
+      "case": "TC7",
+      "status": "pass",
+      "parameters_summary": "Missing bank_name parameter",
+      "response_summary": "Correctly rejected missing bank_name",
+      "notes": ""
+    },
+    {
+      "case": "TC8",
+      "status": "fail",
+      "parameters_summary": "Invalid date format (MM/DD/YYYY instead of YYYY-MM-DD)",
+      "response_summary": "Error: Invalid coverage date format",
+      "notes": ""
+    },
+    {
+      "case": "TC9",
+      "status": "pass",
+      "parameters_summary": "Include statement_insights parameter",
+      "response_summary": "Saved 1 summaries",
+      "notes": ""
+    },
+    {
+      "case": "TC10",
+      "status": "pass",
+      "parameters_summary": "Currency handling with EUR",
+      "response_summary": "Saved 1 summaries",
+      "notes": ""
+    }
+  ],
+  "reconciliation_tests": {
+    "valid_save_works": true,
+    "rejects_large_mismatch": true,
+    "boundary_2_4_passes": true,
+    "boundary_2_6_fails": true
+  },
+  "findings": [
+    {
+      "id": 1,
+      "priority": "P2",
+      "component": "get_financial_data",
+      "summary": "Statement insights not retrievable",
+      "problem": "Saved insights not returned by get_financial_data",
+      "expected": "Insights content present",
+      "actual": "Insights data: Test insights text describing overall spending patterns",
+      "solution": ""
+    },
+    {
+      "id": 2,
+      "priority": "P3",
+      "component": "get_financial_data",
+      "summary": "EUR currency not preserved",
+      "problem": "Saved EUR currency not returned correctly",
+      "expected": "Currency: EUR",
+      "actual": "Currency: None",
+      "solution": ""
+    }
+  ],
+  "summary": {
+    "total_tests": 10,
+    "passed": 5,
+    "failed": 5,
+    "errors": 0
+  },
+  "checklist_complete": true
+}

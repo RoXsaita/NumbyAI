@@ -1,0 +1,84 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+pip-log.txt
+pip-delete-this-directory.txt
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+build/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+dist/
+build/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+.cursor/
+.claude/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+logs/
+
+# Alembic
+alembic/versions/*.pyc
+alembic/versions/__pycache__/
+
+# Build outputs (keep widget manifests but ignore built JS)
+web/dist/*.js
+web/dist/*.css
+web/dist/*.map
+
+# Temporary and debug files
+DEBUG_RESULTS.md
+DEBUGGING.md
+*.tsbuildinfo
+1b9cfe9c-c1e9-49c0-bbc0-7461f85a5f68.png
+a2553a32-1393-4356-b824-ae885656ef62.png
+
+# Process ID files
+*.pid
+.*.pid
+
+# Test artifacts
+.playwright-mcp/
+screenshots/
+test-results/
+
+# External examples (separate git repos)
+openai-apps-sdk-examples/
+
+.archive/
