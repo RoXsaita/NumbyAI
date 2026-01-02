@@ -1,0 +1,29 @@
+{
+    "columns_found": [
+        "Column 0 (Transaction Date)",
+        "Column 1 (Value Date)",
+        "Column 2 (Description)",
+        "Column 3 (Additional Description/Recipient - often NaN)",
+        "Column 4 (Account Number - for some transactions)",
+        "Column 5 (Amount)",
+        "Column 6 (Balance)",
+        "Column 7 (Index/Counter)",
+        "Column 8 (Unnamed - mostly NaN)"
+    ],
+    "date_column": "Column 0",
+    "description_column": "Column 2",
+    "amount_column": "Column 5",
+    "balance_column": "Column 6",
+    "date_format": "DD-MM-YYYY",
+    "currency": "PLN",
+    "has_headers": false,
+    "skip_rows": 1,
+    "amount_positive_is": "credit",
+    "questions": [
+        "Column 0 appears to be the posting/transaction date and Column 1 appears to be the value date. Should we use Column 0 (posting date) for transaction dates, or Column 1 (value date)?",
+        "The amount column (Column 5) uses comma as decimal separator (European format, e.g., '10804,79', '-21,92'). Should the parser automatically convert these to standard decimal format (e.g., '10804.79', '-21.92')?",
+        "Some transactions have account numbers in Column 4 (e.g., '72 1090 1489 0000 0000 4800 3393' for BLIK transactions). Should we extract and store this information, or ignore it?",
+        "The CSV appears to be space-separated or fixed-width format rather than comma-separated. The parser should handle this correctly, but please confirm the delimiter used."
+    ],
+    "confidence": "high"
+}

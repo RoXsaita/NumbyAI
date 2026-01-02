@@ -41,6 +41,8 @@ from app.tools.tool_descriptions import (
 )
 from app.services.cursor_agent_service import (
     call_cursor_agent,
+    call_cursor_agent_chat,
+    call_cursor_agent_chat_stream,
     categorize_transactions_batch,
     learn_merchant_rules
 )
@@ -96,7 +98,11 @@ mcp._mcp_server.description = textwrap.dedent(MCP_SERVER_DESCRIPTION).strip()
 
 @mcp.custom_route("/", methods=["GET"])
 async def root(request):
-    """Friendly landing page so safety scans don't hit 404s."""
+    """Serve the React frontend app"""
+    index_path = WEB_DIST_PATH / "index.html"
+    if index_path.exists():
+        return HTMLResponse(index_path.read_text(encoding="utf-8"))
+    # Fallback if frontend not built yet
     return JSONResponse(
         {
             "status": "ok",
@@ -105,8 +111,9 @@ async def root(request):
                 "mcp": "/mcp",
                 "health": "/health",
                 "widgets": "/widgets",
-                "test_widget": "/test-widget",
+                "app": "/ (React frontend)",
             },
+            "note": "Run 'cd web && npm run build:app' to build the frontend app",
         }
     )
 
@@ -894,24 +901,76 @@ UPLOADS_DIR = Path(__file__).parent.parent / "uploads"
 UPLOADS_DIR.mkdir(exist_ok=True)
 
 
+# Store conversation history per user (in production, use Redis or database)
+_conversation_history: Dict[str, List[Dict[str, str]]] = {}
+
+
 @mcp.custom_route("/api/chat/messages", methods=["POST"])
 async def send_chat_message(request: Request):
     """Send message to AI chat, handle file uploads, trigger flows"""
     try:
-        data = await request.json()
-        message = data.get("message", "")
-        file_data = data.get("file")  # Base64 encoded file or file ID
-        net_flow = data.get("net_flow")
-        user_id = data.get("user_id") or get_or_create_test_user()
+        # Handle FormData (frontend sends FormData)
+        content_type = request.headers.get("content-type", "")
+        if "multipart/form-data" in content_type:
+            form = await request.form()
+            message = form.get("message", "")
+            file = form.get("file")  # File object
+            net_flow = form.get("net_flow")
+            user_id = form.get("user_id")
+        else:
+            # Fallback to JSON
+            data = await request.json()
+            message = data.get("message", "")
+            file = data.get("file")
+            net_flow = data.get("net_flow")
+            user_id = data.get("user_id")
         
-        # TODO: Handle file uploads properly
-        # For now, return a simple response
-        return JSONResponse({
-            "message_id": str(uuid.uuid4()),
-            "response": "Chat functionality will be implemented with Cursor Agent integration"
-        })
+        # Get or create user
+        if not user_id:
+            user_id = get_or_create_test_user()
+        
+        # Get conversation history for this user
+        history = _conversation_history.get(user_id, [])
+        
+        # Handle file uploads (for now, just mention it in the message)
+        if file:
+            if isinstance(file, UploadFile):
+                message = f"User uploaded file: {file.filename}. {message}"
+            else:
+                message = f"User uploaded file. {message}"
+        
+        # Add user message to history
+        history.append({"role": "user", "content": message})
+        
+        # Call Cursor Agent
+        try:
+            response = call_cursor_agent_chat(
+                message=message,
+                user_id=user_id,
+                conversation_history=history
+            )
+            
+            assistant_response = response.get("response", "I'm sorry, I couldn't generate a response.")
+            
+            # Add assistant response to history
+            history.append({"role": "assistant", "content": assistant_response})
+            _conversation_history[user_id] = history[-10:]  # Keep last 10 messages
+            
+            # Generate message ID for potential streaming
+            message_id = str(uuid.uuid4())
+            
+            return JSONResponse({
+                "message_id": message_id,
+                "response": assistant_response
+            })
+        except Exception as e:
+            logger.error("Cursor Agent call failed", {"error": str(e), "traceback": traceback.format_exc()})
+            return JSONResponse({
+                "error": f"Failed to process message: {str(e)}"
+            }, status_code=500)
+            
     except Exception as e:
-        logger.error("Chat message error", {"error": str(e)})
+        logger.error("Chat message error", {"error": str(e), "traceback": traceback.format_exc()})
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
@@ -919,67 +978,517 @@ async def send_chat_message(request: Request):
 async def stream_chat_response(request: Request):
     """Server-Sent Events endpoint for streaming AI responses"""
     message_id = request.query_params.get("message_id")
+    user_message = request.query_params.get("message", "")
+    user_id = request.query_params.get("user_id")
+    
+    if not user_id:
+        user_id = get_or_create_test_user()
+    
+    # Get conversation history
+    history = _conversation_history.get(user_id, [])
     
     async def generate():
-        # TODO: Implement SSE streaming with Cursor Agent
-        yield f"data: {json.dumps({'type': 'message', 'content': 'Streaming not yet implemented'})}\n\n"
+        try:
+            # Add user message to history
+            if user_message:
+                history.append({"role": "user", "content": user_message})
+            
+            # Stream response from Cursor Agent
+            accumulated_text = ""
+            async for chunk in call_cursor_agent_chat_stream(
+                message=user_message,
+                user_id=user_id,
+                conversation_history=history
+            ):
+                accumulated_text += chunk
+                # Send chunk as SSE event
+                yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+            
+            # Add complete response to history
+            if accumulated_text:
+                history.append({"role": "assistant", "content": accumulated_text})
+                _conversation_history[user_id] = history[-10:]  # Keep last 10 messages
+            
+            # Send completion event
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+            
+        except Exception as e:
+            logger.error("Streaming error", {"error": str(e), "traceback": traceback.format_exc()})
+            yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
     
-    return StreamingResponse(generate(), media_type="text/event-stream")
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"  # Disable nginx buffering
+        }
+    )
 
 
 @mcp.custom_route("/api/statements/upload", methods=["POST"])
-async def upload_statement(
-    request: Request,
-    file: UploadFile = File(...),
-    net_flow: float = Form(None),
-    bank_name: str = Form(None)
-):
-    """Upload and parse bank statement (CSV/Excel)"""
+async def upload_statement(request: Request):
+    """Upload and parse bank statement (CSV/Excel) - Enhanced with validation info"""
     try:
         user_id = get_or_create_test_user()  # TODO: Get from auth
+        
+        # Handle multipart form data
+        form = await request.form()
+        file = form.get("file")
+        bank_name = form.get("bank_name")  # Extract bank_name from form
+        
+        if not file:
+            return JSONResponse({"error": "No file provided"}, status_code=400)
+        
+        # Get filename - handle both UploadFile and regular file objects
+        filename = getattr(file, 'filename', None) or 'statement.csv'
+        if hasattr(file, 'file'):
+            file_obj = file.file
+        else:
+            file_obj = file
         
         # Save file temporarily
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         user_upload_dir = UPLOADS_DIR / user_id
         user_upload_dir.mkdir(exist_ok=True)
         
-        file_path = user_upload_dir / f"{timestamp}_{file.filename}"
+        file_path = user_upload_dir / f"{timestamp}_{filename}"
         
         with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+            if hasattr(file_obj, 'read'):
+                shutil.copyfileobj(file_obj, buffer)
+            else:
+                # Handle case where file is already bytes
+                buffer.write(file_obj.read() if hasattr(file_obj, 'read') else file_obj)
         
         logger.info("File uploaded", {
-            "filename": file.filename,
+            "filename": filename,
             "path": str(file_path),
             "user_id": user_id
         })
         
+        # Check user settings for currency
+        from app.database import CategorizationPreference
+        db = SessionLocal()
+        try:
+            settings_pref = db.query(CategorizationPreference).filter(
+                CategorizationPreference.user_id == user_id,
+                CategorizationPreference.preference_type == "settings",
+                CategorizationPreference.name == "user_settings",
+                CategorizationPreference.enabled.is_(True)
+            ).first()
+            user_currency = None
+            if settings_pref and settings_pref.rule:
+                user_currency = settings_pref.rule.get("functional_currency")
+        finally:
+            db.close()
+        
         # Check for existing parsing preferences
+        parsing_preferences_exist = False
+        saved_mappings = None
         if bank_name:
             existing_schema = check_existing_parsing_preferences(bank_name, user_id)
             if existing_schema:
+                parsing_preferences_exist = True
+                saved_mappings = existing_schema
                 # Parse directly using existing schema
                 transactions = parse_csv_statement(str(file_path), existing_schema)
+                
+                # Also return preview data for consistency
+                preview_data = []
+                total_rows = 0
+                total_columns = 0
+                try:
+                    import pandas as pd
+                    # Read without headers to show raw file content
+                    df_preview = pd.read_csv(str(file_path), nrows=30, dtype=str, keep_default_na=False, header=None)
+                    preview_data = df_preview.values.tolist()
+                    total_rows = len(pd.read_csv(str(file_path), dtype=str, header=None))
+                    total_columns = len(df_preview.columns) if len(df_preview) > 0 else 0
+                except Exception as e:
+                    logger.warn("Failed to read preview data for existing bank", {"error": str(e)})
+                
                 return JSONResponse({
                     "job_id": str(uuid.uuid4()),
-                    "status": "parsed",
+                    "status": "ready_to_process",
                     "transactions_count": len(transactions),
-                    "transactions": transactions[:10]  # Return first 10 for preview
+                    "transactions": transactions[:10],  # Return first 10 for preview
+                    "currency_detected": existing_schema.get("currency"),
+                    "currency_required": not bool(user_currency),
+                    "parsing_preferences_exist": True,
+                    "detected_headers": list(existing_schema.get("column_mappings", {}).keys()) if existing_schema else [],
+                    "preview_data": preview_data,
+                    "total_rows": total_rows,
+                    "total_columns": total_columns,
+                    "saved_mappings": saved_mappings  # Include saved mappings for auto-population
                 })
         
         # Analyze statement structure
         analysis = analyze_statement_structure_from_file(str(file_path), user_id)
         
+        # Extract detected headers and preview data from CSV
+        detected_headers = []
+        preview_data = []
+        total_rows = 0
+        total_columns = 0
+        try:
+            import pandas as pd
+            # Read without headers to show raw file content exactly as-is
+            # This allows users to see the actual first row (whether it's headers or data)
+            df_preview = pd.read_csv(str(file_path), nrows=30, dtype=str, keep_default_na=False, header=None)
+            total_rows = len(df_preview)
+            
+            # Convert to 2D array (list of lists)
+            preview_data = df_preview.values.tolist()
+            
+            # Get total row count and column count from file
+            df_full = pd.read_csv(str(file_path), dtype=str, header=None)
+            total_rows = len(df_full)
+            total_columns = len(df_preview.columns) if len(df_preview) > 0 else 0
+            
+            # For backward compatibility, still provide detected_headers as first row if it looks like headers
+            # But this is optional - users will work with numeric column indices
+            detected_headers = preview_data[0] if preview_data else []
+        except Exception as e:
+            logger.warn("Failed to read CSV headers/preview", {"error": str(e)})
+        
+        # Extract currency from analysis
+        currency_detected = analysis.get("currency")
+        
+        # Check if bank has saved preferences (even if not provided in upload)
+        saved_mappings = None
+        if bank_name:
+            existing_schema = check_existing_parsing_preferences(bank_name, user_id)
+            if existing_schema:
+                saved_mappings = existing_schema
+        
         return JSONResponse({
             "job_id": str(uuid.uuid4()),
-            "status": "analysis_required",
+            "status": "validation_required",
             "analysis": analysis,
-            "file_path": str(file_path)
+            "file_path": str(file_path),
+            "currency_detected": currency_detected,
+            "currency_required": not bool(user_currency),
+            "parsing_preferences_exist": bool(saved_mappings),
+            "detected_headers": detected_headers,
+            "preview_data": preview_data,
+            "total_rows": total_rows,
+            "total_columns": total_columns,
+            "saved_mappings": saved_mappings  # Include saved mappings for auto-population
         })
         
     except Exception as e:
         logger.error("File upload error", {"error": str(e)})
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/statements/process", methods=["POST"])
+async def process_statement_automatically(request: Request):
+    """
+    AUTOMATIC statement processing: upload → parse → categorize → save → dashboard
+    
+    This endpoint handles the entire workflow automatically:
+    1. Uploads and parses the statement
+    2. Categorizes all transactions (in parallel)
+    3. Saves the statement summary
+    4. Returns dashboard data
+    
+    Accepts optional header_mapping JSON string from frontend.
+    """
+    try:
+        user_id = get_or_create_test_user()
+        
+        # Handle multipart form data
+        form = await request.form()
+        file = form.get("file")
+        bank_name = form.get("bank_name")
+        net_flow_str = form.get("net_flow")
+        header_mapping = form.get("header_mapping")
+        
+        if not file:
+            return JSONResponse({"error": "No file provided"}, status_code=400)
+        
+        # Get filename - handle both UploadFile and regular file objects
+        filename = getattr(file, 'filename', None) or 'statement.csv'
+        if hasattr(file, 'file'):
+            file_obj = file.file
+        else:
+            file_obj = file
+        
+        net_flow = None
+        if net_flow_str:
+            try:
+                net_flow = float(net_flow_str)
+            except (ValueError, TypeError):
+                pass
+        
+        # Step 1: Save file
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        user_upload_dir = UPLOADS_DIR / user_id
+        user_upload_dir.mkdir(exist_ok=True)
+        file_path = user_upload_dir / f"{timestamp}_{filename}"
+        
+        with open(file_path, "wb") as buffer:
+            if hasattr(file_obj, 'read'):
+                shutil.copyfileobj(file_obj, buffer)
+            else:
+                # Handle case where file is already bytes
+                buffer.write(file_obj.read() if hasattr(file_obj, 'read') else file_obj)
+        
+        logger.info("Auto-processing statement", {
+            "filename": filename,
+            "bank_name": bank_name,
+            "user_id": user_id,
+            "has_header_mapping": bool(header_mapping)
+        })
+        
+        # Step 2: Get or create parsing schema
+        schema = None
+        if bank_name:
+            schema = check_existing_parsing_preferences(bank_name, user_id)
+        
+        if not schema:
+            # Check if header mapping was provided from frontend
+            if header_mapping:
+                try:
+                    mapping_data = json.loads(header_mapping)
+                    # Get user currency
+                    from app.database import CategorizationPreference
+                    db = SessionLocal()
+                    try:
+                        settings_pref = db.query(CategorizationPreference).filter(
+                            CategorizationPreference.user_id == user_id,
+                            CategorizationPreference.preference_type == "settings",
+                            CategorizationPreference.name == "user_settings",
+                            CategorizationPreference.enabled.is_(True)
+                        ).first()
+                        currency = "USD"
+                        if settings_pref and settings_pref.rule:
+                            currency = settings_pref.rule.get("functional_currency", "USD")
+                    finally:
+                        db.close()
+                    
+                    # Build schema from user mapping (new structure with column_mappings dict)
+                    column_mappings = mapping_data.get("column_mappings", {})
+                    if not column_mappings:
+                        # Fallback: try to build from old format
+                        description_col = mapping_data.get("description_column", "")
+                        if isinstance(description_col, str):
+                            description_col = [description_col] if description_col else []
+                        elif not isinstance(description_col, list):
+                            description_col = []
+                        column_mappings = {
+                            "date": mapping_data.get("date_column", ""),
+                            "description": description_col,
+                            "amount": mapping_data.get("amount_column", ""),
+                        }
+                        if mapping_data.get("balance_column"):
+                            column_mappings["balance"] = mapping_data["balance_column"]
+                    
+                    schema = {
+                        "column_mappings": column_mappings,
+                        "date_format": mapping_data.get("date_format", "DD/MM/YYYY"),
+                        "currency": currency,
+                        "has_headers": False,  # Always false - we use first_transaction_row instead
+                        "skip_rows": 0,  # Will be calculated from first_transaction_row in parser
+                        "first_transaction_row": mapping_data.get("first_transaction_row", 1),
+                        "amount_positive_is": "debit",
+                    }
+                    
+                    logger.info("Built parsing schema from header mapping", {
+                        "bank_name": bank_name,
+                        "column_mappings": column_mappings,
+                        "column_mappings_types": {k: type(v).__name__ for k, v in column_mappings.items()},
+                        "first_transaction_row": schema["first_transaction_row"]
+                    })
+                    
+                    # Save schema for future use
+                    if bank_name:
+                        save_parsing_schema(schema, bank_name, user_id)
+                except json.JSONDecodeError:
+                    logger.warn("Failed to parse header_mapping, falling back to analysis")
+                    schema = None
+            
+            if not schema:
+                # Auto-analyze structure (use AI to detect format)
+                logger.info("No existing schema, analyzing statement structure")
+                analysis = analyze_statement_structure_from_file(str(file_path), user_id)
+                
+                # Auto-build schema from analysis (use defaults for missing info)
+                schema = build_parsing_schema(analysis, {})
+                
+                # Save schema for future use
+                if bank_name:
+                    save_parsing_schema(schema, bank_name, user_id)
+        
+        # Step 3: Parse transactions
+        transactions = parse_csv_statement(str(file_path), schema)
+        logger.info(f"Parsed {len(transactions)} transactions")
+        
+        if not transactions:
+            return JSONResponse({
+                "error": "No transactions found in statement",
+                "status": "error"
+            }, status_code=400)
+        
+        # Step 4: Normalize transactions (extract merchant, etc.)
+        normalized_txs = []
+        for tx in transactions:
+            normalized = normalize_transaction(tx, schema)
+            normalized_txs.append(normalized)
+        
+        # Step 5: Get existing categorization rules
+        from app.database import CategorizationRule
+        db = SessionLocal()
+        try:
+            rules = db.query(CategorizationRule).filter(
+                CategorizationRule.user_id == user_id,
+                CategorizationRule.enabled.is_(True)
+            ).all()
+            existing_rules = [{
+                "merchant_pattern": r.merchant_pattern,
+                "category": r.category
+            } for r in rules]
+        finally:
+            db.close()
+        
+        # Step 6: Categorize transactions using AI (in parallel batches)
+        # Add IDs to transactions for categorization
+        tx_with_ids = [
+            {**tx, "id": idx + 1}
+            for idx, tx in enumerate(normalized_txs)
+        ]
+        
+        logger.info("Starting parallel categorization", {
+            "transaction_count": len(tx_with_ids),
+            "batch_size": 20
+        })
+        
+        categorized = categorize_transactions_batch(
+            tx_with_ids,
+            user_id,
+            existing_rules,
+            batch_size=20,
+            parallel=True
+        )
+        
+        # Create mapping of ID to category
+        category_map = {item["id"]: item["category"] for item in categorized}
+        
+        # Step 6.5: Save individual transactions to database
+        logger.info("Saving individual transactions to database", {
+            "transaction_count": len(normalized_txs),
+            "bank_name": bank_name
+        })
+        
+        db_save = SessionLocal()
+        try:
+            for idx, tx in enumerate(normalized_txs):
+                tx_id = idx + 1
+                category = category_map.get(tx_id, "Other")
+                
+                # Convert date to date object if it's a string
+                tx_date = tx["date"]
+                if isinstance(tx_date, str):
+                    from datetime import datetime as dt
+                    tx_date = dt.fromisoformat(tx_date).date()
+                
+                transaction = Transaction(
+                    user_id=user_id,
+                    date=tx_date,
+                    description=tx["description"],
+                    merchant=tx.get("merchant"),
+                    amount=float(tx["amount"]),
+                    currency=tx.get("currency", schema.get("currency", "USD")),
+                    category=category,
+                    bank_name=bank_name,
+                    profile=None,  # Can be added later if needed
+                )
+                db_save.add(transaction)
+            
+            db_save.commit()
+            logger.info(f"Saved {len(normalized_txs)} transactions to database", {
+                "bank_name": bank_name,
+                "user_id": user_id
+            })
+        except Exception as e:
+            db_save.rollback()
+            logger.error("Failed to save transactions to database", {
+                "error": str(e),
+                "traceback": traceback.format_exc()
+            })
+            raise
+        finally:
+            db_save.close()
+        
+        # Step 7: Aggregate by category
+        from collections import defaultdict
+        from datetime import datetime as dt
+        category_totals = defaultdict(float)
+        category_counts = defaultdict(int)
+        dates = []
+        
+        for idx, tx in enumerate(normalized_txs):
+            tx_id = idx + 1
+            category = category_map.get(tx_id, "Other")
+            category_totals[category] += tx["amount"]
+            category_counts[category] += 1
+            if isinstance(tx["date"], str):
+                dates.append(dt.fromisoformat(tx["date"]).date())
+            else:
+                dates.append(tx["date"])
+        
+        # Step 8: Build category summaries
+        coverage_from = min(dates).isoformat() if dates else ""
+        coverage_to = max(dates).isoformat() if dates else ""
+        month_year = coverage_to[:7] if coverage_to else ""  # YYYY-MM format
+        
+        category_summaries = []
+        for cat, amount in category_totals.items():
+            category_summaries.append({
+                "category": cat,
+                "amount": float(amount),
+                "currency": schema.get("currency", "USD"),
+                "month_year": month_year,
+                "transaction_count": category_counts[cat]
+            })
+        
+        # Step 9: Calculate net flow if not provided
+        if net_flow is None:
+            # Calculate from transaction amounts
+            net_flow = sum(tx["amount"] for tx in normalized_txs)
+        
+        # Step 10: Save statement summary
+        result = await save_statement_summary_handler(
+            category_summaries=category_summaries,
+            bank_name=bank_name or "Unknown",
+            statement_net_flow=float(net_flow),
+            coverage_from=coverage_from,
+            coverage_to=coverage_to,
+            user_id=user_id
+        )
+        
+        # Step 11: Get dashboard data
+        dashboard_data = get_financial_data_handler(user_id=user_id)
+        
+        return JSONResponse({
+            "status": "success",
+            "transactions_processed": len(normalized_txs),
+            "categories": len(category_summaries),
+            "dashboard": dashboard_data.get("_meta", dashboard_data.get("structuredContent", {})),
+            "message": f"Successfully processed {len(normalized_txs)} transactions across {len(category_summaries)} categories"
+        })
+        
+    except Exception as e:
+        logger.error("Auto-processing error", {
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        })
+        return JSONResponse({
+            "status": "error",
+            "error": str(e)
+        }, status_code=500)
 
 
 @mcp.custom_route("/api/transactions", methods=["GET"])
@@ -1164,6 +1673,81 @@ async def manage_preferences_api(request: Request):
         
     except Exception as e:
         logger.error("Preferences API error", {"error": str(e)})
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/banks", methods=["GET", "POST"])
+async def manage_banks_api(request: Request):
+    """Get or add banks for user"""
+    try:
+        user_id = get_or_create_test_user()  # TODO: Get from auth
+        
+        if request.method == "GET":
+            # Get registered banks from user settings
+            from app.database import CategorizationPreference
+            db = SessionLocal()
+            try:
+                settings_pref = db.query(CategorizationPreference).filter(
+                    CategorizationPreference.user_id == user_id,
+                    CategorizationPreference.preference_type == "settings",
+                    CategorizationPreference.name == "user_settings",
+                    CategorizationPreference.enabled.is_(True)
+                ).first()
+                
+                banks = []
+                if settings_pref and settings_pref.rule:
+                    banks = settings_pref.rule.get("registered_banks", [])
+                
+                return JSONResponse({"banks": banks})
+            finally:
+                db.close()
+        
+        elif request.method == "POST":
+            # Add new bank to registered_banks
+            data = await request.json()
+            bank_name = data.get("bank_name")
+            
+            if not bank_name:
+                return JSONResponse({"error": "bank_name is required"}, status_code=400)
+            
+            # Get current banks
+            from app.database import CategorizationPreference
+            db = SessionLocal()
+            try:
+                settings_pref = db.query(CategorizationPreference).filter(
+                    CategorizationPreference.user_id == user_id,
+                    CategorizationPreference.preference_type == "settings",
+                    CategorizationPreference.name == "user_settings",
+                    CategorizationPreference.enabled.is_(True)
+                ).first()
+                
+                current_banks = []
+                settings_data = {}
+                if settings_pref and settings_pref.rule:
+                    settings_data = settings_pref.rule.copy()
+                    current_banks = settings_data.get("registered_banks", [])
+                
+                # Add new bank if not already present (case-insensitive)
+                bank_lower = bank_name.strip().lower()
+                if not any(b.lower() == bank_lower for b in current_banks):
+                    current_banks.append(bank_name.strip())
+                    settings_data["registered_banks"] = current_banks
+                    
+                    # Save via save_preferences_handler
+                    result = await save_preferences_handler(
+                        preferences=[settings_data],
+                        preference_type="settings",
+                        user_id=user_id
+                    )
+                    
+                    return JSONResponse({"banks": current_banks, "status": "added"})
+                else:
+                    return JSONResponse({"banks": current_banks, "status": "already_exists"})
+            finally:
+                db.close()
+        
+    except Exception as e:
+        logger.error("Banks API error", {"error": str(e)})
         return JSONResponse({"error": str(e)}, status_code=500)
 
 

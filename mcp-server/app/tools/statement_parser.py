@@ -27,52 +27,140 @@ def parse_csv_statement(file_path: str, schema: Dict) -> List[Dict]:
                 - date_format: "MM/DD/YYYY" or similar
                 - currency: "USD" or similar
                 - has_headers: bool
-                - skip_rows: int
+                - skip_rows: int (0-indexed, number of rows to skip)
+                - first_transaction_row: int (1-indexed, user-friendly row number of first transaction)
                 - amount_positive_is: "debit" or "credit"
     
     Returns:
         List of raw transaction dicts with: date, description, amount, balance (if available)
     """
     try:
-        # Determine file type
+        # Calculate skip_rows from first_transaction_row
+        # first_transaction_row is 1-indexed (user-friendly)
+        # skip_rows is 0-indexed (number of rows to skip before reading)
+        skip_rows = 0
+        if 'first_transaction_row' in schema and schema.get('first_transaction_row'):
+            first_row = int(schema['first_transaction_row'])
+            # Skip all rows before the first transaction row
+            # Example: first_transaction_row=3 means skip rows 0 and 1 (rows 1 and 2 in file)
+            skip_rows = max(0, first_row - 1)
+        
+        # Always read without headers - this creates a DataFrame with numeric column indices (0, 1, 2, ...)
+        # This ensures consistency whether the file has headers or not
         if file_path.endswith('.xlsx') or file_path.endswith('.xls'):
-            df = pd.read_excel(file_path, header=0 if schema.get('has_headers', True) else None, 
-                             skiprows=schema.get('skip_rows', 0))
+            df = pd.read_excel(file_path, header=None, skiprows=skip_rows)
         else:
-            df = pd.read_csv(file_path, header=0 if schema.get('has_headers', True) else None,
-                           skiprows=schema.get('skip_rows', 0))
+            df = pd.read_csv(file_path, header=None, skiprows=skip_rows)
         
         logger.info("Parsed statement file", {
             "file_path": file_path,
             "rows": len(df),
-            "columns": list(df.columns)
+            "columns": list(df.columns),
+            "skip_rows": skip_rows,
+            "first_transaction_row": schema.get('first_transaction_row', 1)
         })
         
         # Get column mappings
         column_mappings = schema.get('column_mappings', {})
         date_col = column_mappings.get('date')
-        description_col = column_mappings.get('description')
+        description_col = column_mappings.get('description')  # Can be string or list
         amount_col = column_mappings.get('amount')
         balance_col = column_mappings.get('balance')  # Optional
+        vendor_payee_col = column_mappings.get('vendor_payee')  # New
+        category_col = column_mappings.get('category')  # New
+        inflow_col = column_mappings.get('inflow')  # New
+        outflow_col = column_mappings.get('outflow')  # New
+        currency_col = column_mappings.get('currency')  # New
+        
+        # Normalize description_col to list
+        if isinstance(description_col, str):
+            description_cols = [description_col]
+        elif isinstance(description_col, list):
+            description_cols = description_col
+        else:
+            description_cols = []
         
         # Validate required columns exist
-        if not date_col or not description_col or not amount_col:
-            raise ValueError(f"Missing required column mappings: date={date_col}, description={description_col}, amount={amount_col}")
+        if not date_col or not description_cols or not amount_col:
+            raise ValueError(f"Missing required column mappings: date={date_col}, description={description_cols}, amount={amount_col}")
         
         # Map column names (handle both column names and indices like "Column A")
         date_col_name = _resolve_column_name(df, date_col)
-        description_col_name = _resolve_column_name(df, description_col)
+        description_col_names = [_resolve_column_name(df, col) for col in description_cols]
         amount_col_name = _resolve_column_name(df, amount_col)
         balance_col_name = _resolve_column_name(df, balance_col) if balance_col else None
+        vendor_payee_col_name = _resolve_column_name(df, vendor_payee_col) if vendor_payee_col else None
+        category_col_name = _resolve_column_name(df, category_col) if category_col else None
+        inflow_col_name = _resolve_column_name(df, inflow_col) if inflow_col else None
+        outflow_col_name = _resolve_column_name(df, outflow_col) if outflow_col else None
+        currency_col_name = _resolve_column_name(df, currency_col) if currency_col else None
         
-        if not date_col_name or not description_col_name or not amount_col_name:
-            raise ValueError(f"Could not resolve column names from mappings")
+        # Get first column index for transaction IDs (optional)
+        first_column_index = schema.get('first_column_index')
+        first_column_name = None
+        if first_column_index is not None:
+            # Convert index to string for resolution
+            first_column_name = _resolve_column_name(df, str(first_column_index))
+        
+        # Validate all resolved
+        failed_resolutions = []
+        if not date_col_name:
+            failed_resolutions.append(f"date: {date_col}")
+        if not all(description_col_names):
+            failed_descriptions = [description_cols[i] for i, resolved in enumerate(description_col_names) if not resolved]
+            failed_resolutions.append(f"description: {failed_descriptions}")
+        if not amount_col_name:
+            failed_resolutions.append(f"amount: {amount_col}")
+        
+        if failed_resolutions:
+            logger.error("Column resolution failed", {
+                "failed_columns": failed_resolutions,
+                "date_col": date_col,
+                "date_col_name": date_col_name,
+                "description_cols": description_cols,
+                "description_col_names": description_col_names,
+                "amount_col": amount_col,
+                "amount_col_name": amount_col_name,
+                "df_columns": list(df.columns),
+                "df_column_types": [type(c).__name__ for c in df.columns],
+                "has_headers": schema.get('has_headers', False),
+                "first_transaction_row": schema.get('first_transaction_row', 1),
+            })
+            
+            # Get bank name from schema if available
+            bank_name = schema.get('bank_name', 'your bank')
+            
+            error_msg = (
+                f"Could not resolve column names from mappings: {', '.join(failed_resolutions)}\n\n"
+                f"This usually means the saved column mappings contain data values instead of column indices.\n\n"
+                f"Action required:\n"
+                f"1. The column mappings for '{bank_name}' are corrupted and need to be cleared\n"
+                f"2. Re-upload your statement and manually re-map the columns\n"
+                f"3. Column references should be numeric indices like '0', '1', '2' (preferred)\n"
+                f"   - NOT column names like 'Date', 'Amount'\n"
+                f"   - NOT column letters like 'Column A', 'Column B'\n"
+                f"   - NOT data values like '02-01-2025', '21483,27'\n\n"
+                f"Available columns in your file: {list(df.columns)}\n\n"
+                f"If this issue persists, please contact support with bank name: {bank_name}"
+            )
+            raise ValueError(error_msg)
         
         # Parse transactions
         transactions = []
         date_format = schema.get('date_format', '%Y-%m-%d')
         currency = schema.get('currency', 'USD')
         amount_positive_is = schema.get('amount_positive_is', 'debit')
+        if amount_col_name is not None:
+            try:
+                amount_series = df[amount_col_name].astype(str)
+                has_explicit_sign = any(
+                    ('-' in val) or (val.strip().startswith('(') and val.strip().endswith(')'))
+                    for val in amount_series
+                )
+                if has_explicit_sign:
+                    amount_positive_is = 'signed'
+            except Exception:
+                pass
         
         for idx, row in df.iterrows():
             try:
@@ -80,19 +168,87 @@ def parse_csv_statement(file_path: str, schema: Dict) -> List[Dict]:
                 date_str = str(row[date_col_name]).strip()
                 date = _parse_date(date_str, date_format)
                 
-                # Get description
-                description = str(row[description_col_name]).strip()
+                # Get description - concatenate multiple columns if specified
+                description_parts = []
+                for desc_col_name in description_col_names:
+                    if desc_col_name and pd.notna(row.get(desc_col_name)):
+                        part = str(row[desc_col_name]).strip()
+                        if part and part != 'nan' and part != 'None':
+                            description_parts.append(part)
+                description = ' '.join(description_parts).strip()
                 
-                # Parse amount
-                amount_str = str(row[amount_col_name]).strip()
-                amount = _parse_amount(amount_str)
+                # Get vendor/payee if available
+                vendor_payee = None
+                if vendor_payee_col_name and pd.notna(row.get(vendor_payee_col_name)):
+                    vendor_payee = str(row[vendor_payee_col_name]).strip()
+                    if vendor_payee == 'nan' or vendor_payee == 'None':
+                        vendor_payee = None
                 
-                # Apply sign convention: if amount_positive_is="credit" and amount is positive, it's income
-                # If amount_positive_is="debit" and amount is positive, it's expense (make negative)
-                if amount_positive_is == 'debit' and amount > 0:
-                    amount = -abs(amount)  # Expenses are negative
-                elif amount_positive_is == 'credit' and amount < 0:
-                    amount = abs(amount)  # Credits are positive
+                # Get category if available
+                category = None
+                if category_col_name and pd.notna(row.get(category_col_name)):
+                    category = str(row[category_col_name]).strip()
+                    if category == 'nan' or category == 'None':
+                        category = None
+                
+                # Parse amount - check if inflow/outflow are mapped instead
+                amount = None
+                inflow = None
+                outflow = None
+                
+                if inflow_col_name or outflow_col_name:
+                    # Inflow and/or outflow are mapped - use them instead of amount
+                    if inflow_col_name and pd.notna(row.get(inflow_col_name)):
+                        inflow_str = str(row[inflow_col_name]).strip()
+                        if inflow_str and inflow_str != 'nan' and inflow_str != 'None' and inflow_str:
+                            try:
+                                inflow = float(_parse_amount(inflow_str))
+                            except:
+                                inflow = None
+                    if outflow_col_name and pd.notna(row.get(outflow_col_name)):
+                        outflow_str = str(row[outflow_col_name]).strip()
+                        if outflow_str and outflow_str != 'nan' and outflow_str != 'None' and outflow_str:
+                            try:
+                                outflow = float(_parse_amount(outflow_str))
+                            except:
+                                outflow = None
+                    # Calculate amount from inflow/outflow
+                    if inflow is not None and outflow is not None:
+                        amount = Decimal(str(inflow - outflow))
+                    elif inflow is not None:
+                        amount = Decimal(str(inflow))
+                    elif outflow is not None:
+                        amount = Decimal(str(-outflow))
+                    else:
+                        amount = Decimal('0')
+                else:
+                    # Use amount column
+                    amount_str = str(row[amount_col_name]).strip()
+                    amount = _parse_amount(amount_str)
+                    
+                    # Apply sign convention only when amounts are not explicitly signed
+                    if amount_positive_is == 'debit' and amount > 0:
+                        amount = -abs(amount)  # Expenses are negative
+                    elif amount_positive_is == 'credit' and amount < 0:
+                        amount = abs(amount)  # Credits are positive
+                    
+                    # Set inflow/outflow based on amount
+                    if amount > 0:
+                        inflow = float(amount)
+                        outflow = None
+                    elif amount < 0:
+                        inflow = None
+                        outflow = float(abs(amount))
+                    else:
+                        inflow = None
+                        outflow = None
+                
+                # Get currency from column or use default
+                transaction_currency = currency
+                if currency_col_name and pd.notna(row.get(currency_col_name)):
+                    currency_str = str(row[currency_col_name]).strip()
+                    if currency_str and currency_str != 'nan' and currency_str != 'None':
+                        transaction_currency = currency_str
                 
                 # Get balance if available
                 balance = None
@@ -100,13 +256,28 @@ def parse_csv_statement(file_path: str, schema: Dict) -> List[Dict]:
                     balance_str = str(row[balance_col_name]).strip()
                     balance = _parse_amount(balance_str)
                 
+                # Get transaction ID from first column if specified
+                transaction_id = None
+                if first_column_name and pd.notna(row.get(first_column_name)):
+                    transaction_id_str = str(row[first_column_name]).strip()
+                    if transaction_id_str and transaction_id_str != 'nan' and transaction_id_str != 'None':
+                        transaction_id = transaction_id_str
+                
                 transaction = {
                     'date': date,
+                    'vendor_payee': vendor_payee,
                     'description': description,
-                    'amount': float(amount),
-                    'currency': currency,
+                    'category': category,
+                    'amount': float(amount) if amount is not None else 0.0,
+                    'inflow': float(inflow) if inflow is not None else None,
+                    'outflow': float(outflow) if outflow is not None else None,
                     'balance': float(balance) if balance is not None else None,
+                    'currency': transaction_currency,
                 }
+                
+                # Add transaction_id if available
+                if transaction_id:
+                    transaction['transaction_id'] = transaction_id
                 
                 transactions.append(transaction)
                 
@@ -132,39 +303,59 @@ def parse_csv_statement(file_path: str, schema: Dict) -> List[Dict]:
         raise
 
 
-def _resolve_column_name(df: pd.DataFrame, column_ref: str) -> Optional[str]:
+def _resolve_column_name(df: pd.DataFrame, column_ref: str):
     """
-    Resolve column reference to actual column name.
+    Resolve column reference to actual column index.
+    
+    Since we always read files with header=None, DataFrame columns are integers (0, 1, 2, ...).
+    This function validates that column_ref is a valid numeric index and returns the integer.
     
     Handles:
-    - Column names directly: "Date", "Transaction Description"
-    - Column indices: "Column A", "Column B" (0-indexed: A=0, B=1, etc.)
-    - Column indices as numbers: "0", "1", "2"
+    - Column indices as numbers: "0", "1", "2" (preferred and only reliable method)
+    
+    Returns the actual column index (integer).
     """
     if not column_ref:
         return None
     
-    # Try direct column name match
-    if column_ref in df.columns:
-        return column_ref
+    # Validate that column_ref looks like a column reference, not data
+    # If it contains date-like patterns, commas (for numbers), or looks like transaction data,
+    # it's likely a data value, not a column reference
+    if isinstance(column_ref, str):
+        # Check if it looks like a date (contains dashes or slashes with numbers)
+        if re.match(r'^\d{1,2}[-/]\d{1,2}[-/]\d{2,4}$', column_ref):
+            logger.error("Column reference looks like a date value, not a column index", {
+                "column_ref": column_ref,
+                "hint": "Column references should be numeric indices like '0', '1', '2'"
+            })
+            return None
+        # Check if it looks like a large number or currency amount
+        if re.match(r'^\d+[.,]\d+$', column_ref) or (column_ref.replace(',', '').replace('.', '').replace('-', '').isdigit() and len(column_ref) > 4):
+            logger.error("Column reference looks like a numeric value, not a column index", {
+                "column_ref": column_ref,
+                "hint": "Column references should be numeric indices like '0', '1', '2'"
+            })
+            return None
     
-    # Try column index format "Column A", "Column B", etc.
-    column_index_match = re.match(r'^Column\s+([A-Z])$', column_ref, re.IGNORECASE)
-    if column_index_match:
-        letter = column_index_match.group(1).upper()
-        col_idx = ord(letter) - ord('A')
-        if 0 <= col_idx < len(df.columns):
-            return df.columns[col_idx]
-    
-    # Try numeric index
+    # Parse as numeric index (only reliable method with header=None)
     try:
         col_idx = int(column_ref)
         if 0 <= col_idx < len(df.columns):
-            return df.columns[col_idx]
-    except ValueError:
-        pass
-    
-    return None
+            # Return the actual column index (integer)
+            return col_idx
+        else:
+            logger.warn("Column index out of range", {
+                "column_ref": column_ref,
+                "max_columns": len(df.columns)
+            })
+            return None
+    except (ValueError, TypeError):
+        logger.warn("Could not parse column reference as integer", {
+            "column_ref": column_ref,
+            "column_ref_type": type(column_ref).__name__,
+            "hint": "Column references must be numeric indices like '0', '1', '2'"
+        })
+        return None
 
 
 def _parse_date(date_str: str, date_format: str) -> datetime:
@@ -186,7 +377,7 @@ def _parse_date(date_str: str, date_format: str) -> datetime:
         return datetime.strptime(date_str, python_format).date()
     except ValueError:
         # Try common formats as fallback
-        for fmt in ['%Y-%m-%d', '%m/%d/%Y', '%d/%m/%Y', '%Y/%m/%d']:
+        for fmt in ['%Y-%m-%d', '%m/%d/%Y', '%d/%m/%Y', '%Y/%m/%d', '%d-%m-%Y', '%m-%d-%Y']:
             try:
                 return datetime.strptime(date_str, fmt).date()
             except ValueError:
@@ -198,14 +389,23 @@ def _parse_amount(amount_str: str) -> Decimal:
     """Parse amount string, handling currency symbols, commas, parentheses for negatives."""
     # Remove currency symbols
     amount_str = re.sub(r'[$€£¥]', '', amount_str)
-    
-    # Remove commas
-    amount_str = amount_str.replace(',', '')
+    amount_str = amount_str.replace(' ', '')
     
     # Handle parentheses for negatives (accounting format)
     if amount_str.startswith('(') and amount_str.endswith(')'):
         amount_str = '-' + amount_str[1:-1]
     
+    # Normalize decimal separator
+    if ',' in amount_str and '.' in amount_str:
+        # If both separators are present, assume the right-most one is decimal
+        if amount_str.rfind(',') > amount_str.rfind('.'):
+            amount_str = amount_str.replace('.', '').replace(',', '.')
+        else:
+            amount_str = amount_str.replace(',', '')
+    elif ',' in amount_str and '.' not in amount_str:
+        # Treat comma as decimal separator
+        amount_str = amount_str.replace(',', '.')
+
     # Remove whitespace
     amount_str = amount_str.strip()
     

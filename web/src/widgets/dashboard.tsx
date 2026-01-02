@@ -8,11 +8,6 @@ import {
   type ChangeSummary,
 } from '../shared/schemas';
 
-// Journey system imports
-import { calculateProgress, ProgressState, ProgressInput } from '../lib/progression';
-import { StatusBar } from '../components/StatusBar';
-import { JourneyPath } from '../components/JourneyPath';
-import { Confetti } from '../components/Confetti';
 import {
   buildPivotRowDisplays,
   buildMonthlyFlowSeries,
@@ -34,7 +29,7 @@ import {
 import { useTheme, useDisplayMode } from '../lib/use-openai-global';
 import { useIntrinsicHeight } from '../lib/use-intrinsic-height';
 import { ErrorBoundary } from '../components/ErrorBoundary';
-import { apiClient } from '../lib/api-client';
+import { apiClient, type Transaction as ApiTransaction } from '../lib/api-client';
 
 declare global {
   interface Window {
@@ -2347,7 +2342,7 @@ const SavingsGauge: React.FC<SavingsGaugeProps> = ({ rate, theme }) => {
 // MAIN DASHBOARD WIDGET
 // ============================================================================
 
-type TabType = 'journey' | 'overview' | 'cashflow' | 'trends' | 'budget' | 'details' | 'preferences';
+type TabType = 'overview' | 'cashflow' | 'trends' | 'budget' | 'details' | 'preferences';
 
 // Type for preferences data
 interface CategorizationRule {
@@ -2540,75 +2535,6 @@ export const DashboardWidget: React.FC = () => {
     }
   }, [data?.initial_filters?.default_tab]);
   
-  // Celebration state for journey milestones
-  const [showConfetti, setShowConfetti] = useState(false);
-  const [celebrationMilestone, setCelebrationMilestone] = useState<string | null>(null);
-  
-  // Calculate user progress for journey system
-  // Derives progress from dashboard data - counts actual data entities
-  const progressState = useMemo((): ProgressState | null => {
-    if (!data) return null;
-    
-    // Count unique bank+month combinations (statement count)
-    // Each unique bank+month combo from category_summaries represents one statement
-    const bankMonthCombos = new Set<string>();
-    if (data.category_summaries) {
-      data.category_summaries.forEach(cs => {
-        if (cs.bank_name && cs.month_year) {
-          bankMonthCombos.add(`${cs.bank_name}|${cs.month_year}`);
-        }
-      });
-    }
-    const statementCount = bankMonthCombos.size;
-    
-    // Count budgets that have actual values set
-    const budgetCount = data.pivot?.budgets
-      ? data.pivot.budgets.filter(row => row.some(v => v > 0)).length
-      : 0;
-    
-    // Use actual user_settings for progression (only includes values actually set by user)
-    // Fall back to banks count if user_settings not available
-    const userSettings = data?.user_settings;
-    const progressSettings: ProgressInput['settings'] = userSettings ? {
-      // Only include functional_currency if it's actually set (not null/undefined)
-      ...(userSettings.functional_currency ? { functional_currency: userSettings.functional_currency } : {}),
-      ...(userSettings.bank_accounts_count !== undefined && userSettings.bank_accounts_count !== null 
-        ? { bank_accounts_count: userSettings.bank_accounts_count } : {}),
-      ...(userSettings.onboarding_complete !== undefined && userSettings.onboarding_complete !== null 
-        ? { onboarding_complete: userSettings.onboarding_complete } : {}),
-    } : {
-      // If no user_settings, only include bank_accounts_count from data
-      bank_accounts_count: data?.banks?.length || 0,
-    };
-    
-    const progressInput: ProgressInput = {
-      settings: progressSettings,
-      dataOverview: {
-        total_months: data?.available_months?.length || data?.pivot?.months?.length || 0,
-        banks: data?.banks?.map(b => ({ name: b })) || [],
-        budgets_configured: budgetCount,
-      },
-      catCount: data?.pivot?.categories?.length || 0,
-      parsingCount: data?.banks?.length || 0,
-      statementCount: statementCount,
-      mutationCount: 1, // Assume some mutations have happened
-    };
-    
-    return calculateProgress(progressInput);
-  }, [data]);
-
-  // Handler for claiming milestones
-  const handleMilestoneClaim = (milestoneId: string) => {
-    setCelebrationMilestone(milestoneId);
-    setShowConfetti(true);
-    
-    // Hide confetti after animation
-    setTimeout(() => {
-      setShowConfetti(false);
-      setCelebrationMilestone(null);
-    }, 3000);
-  };
-  
   // Inline editing state for the details table
   const [isEditingTable, setIsEditingTable] = useState(false);
   const [editedCells, setEditedCells] = useState<Record<string, string>>({});
@@ -2640,6 +2566,14 @@ export const DashboardWidget: React.FC = () => {
   } | null>(null);
   const [transferToCategory, setTransferToCategory] = useState('');
   const [transferAmount, setTransferAmount] = useState('');
+
+  // Transactions list state (Details tab)
+  const [transactions, setTransactions] = useState<ApiTransaction[]>([]);
+  const [transactionsLoading, setTransactionsLoading] = useState(false);
+  const [transactionsError, setTransactionsError] = useState<string | null>(null);
+  const [editingTransactionId, setEditingTransactionId] = useState<string | null>(null);
+  const [editingTransactionCategory, setEditingTransactionCategory] = useState('');
+  const [isSavingTransaction, setIsSavingTransaction] = useState(false);
   
   
   const rootRef = useIntrinsicHeight();
@@ -2707,6 +2641,143 @@ export const DashboardWidget: React.FC = () => {
   // Statement-level insights only (category-level insights removed per issue #88)
   const hasStatementInsights = !!data?.statement_insights?.trim();
 
+  const refreshDashboardData = React.useCallback(
+    async (filters?: { bank_name?: string; month_year?: string; profile?: string }) => {
+      const refreshData = await apiClient.getFinancialData(filters);
+      const refreshValidated = dashboardPropsSchema.safeParse(refreshData);
+      if (refreshValidated.success) {
+        setLocalDashboardData({ ...refreshValidated.data, initial_filters: null });
+      } else {
+        console.error('Dashboard data failed validation after refresh', refreshValidated.error);
+      }
+    },
+    []
+  );
+
+  const getMonthKey = React.useCallback((dateString: string) => {
+    if (!dateString) return '';
+    if (dateString.length >= 7) return dateString.slice(0, 7);
+    const parsed = new Date(dateString);
+    if (Number.isNaN(parsed.getTime())) return '';
+    const month = `${parsed.getMonth() + 1}`.padStart(2, '0');
+    return `${parsed.getFullYear()}-${month}`;
+  }, []);
+
+  const getMonthDateRange = React.useCallback((monthYear: string) => {
+    const [yearStr, monthStr] = monthYear.split('-');
+    const year = Number(yearStr);
+    const month = Number(monthStr);
+    if (!year || !month) {
+      return { from: undefined, to: undefined };
+    }
+    const lastDay = new Date(year, month, 0).getDate();
+    const paddedMonth = `${month}`.padStart(2, '0');
+    return {
+      from: `${year}-${paddedMonth}-01`,
+      to: `${year}-${paddedMonth}-${`${lastDay}`.padStart(2, '0')}`,
+    };
+  }, []);
+
+  const loadTransactions = React.useCallback(async () => {
+    setTransactionsLoading(true);
+    setTransactionsError(null);
+    setEditingTransactionId(null);
+    setEditingTransactionCategory('');
+
+    try {
+      const bankFilter = selectedBanks.length === 1 ? selectedBanks[0] : undefined;
+      const monthFilter = selectedMonths.length === 1 ? selectedMonths[0] : undefined;
+      const { from, to } = monthFilter ? getMonthDateRange(monthFilter) : { from: undefined, to: undefined };
+
+      const response = await apiClient.getTransactions({
+        bank_name: bankFilter,
+        date_from: from,
+        date_to: to,
+      });
+
+      let list = response.transactions || [];
+
+      if (selectedBanks.length > 0) {
+        list = list.filter(tx => selectedBanks.includes(tx.bank_name));
+      }
+
+      if (selectedMonths.length > 0) {
+        list = list.filter(tx => selectedMonths.includes(getMonthKey(tx.date)));
+      }
+
+      if (selectedProfiles.length > 0) {
+        list = list.filter(tx => tx.profile && selectedProfiles.includes(tx.profile));
+      }
+
+      setTransactions(list);
+    } catch (error) {
+      console.error('Error loading transactions:', error);
+      setTransactionsError(error instanceof Error ? error.message : 'Failed to load transactions');
+    } finally {
+      setTransactionsLoading(false);
+    }
+  }, [selectedBanks, selectedMonths, selectedProfiles, getMonthDateRange, getMonthKey]);
+
+  React.useEffect(() => {
+    if (activeTab !== 'details') return;
+    loadTransactions();
+  }, [activeTab, loadTransactions]);
+
+  const startEditingTransaction = (tx: ApiTransaction) => {
+    setEditingTransactionId(tx.id);
+    setEditingTransactionCategory(tx.category);
+  };
+
+  const cancelEditingTransaction = () => {
+    setEditingTransactionId(null);
+    setEditingTransactionCategory('');
+  };
+
+  const handleSaveTransactionCategory = async (transactionId: string) => {
+    if (isSavingTransaction) return;
+    const nextCategory = editingTransactionCategory.trim();
+    if (!nextCategory) {
+      setTransactionsError('Category cannot be empty.');
+      return;
+    }
+    const currentTx = transactions.find(tx => tx.id === transactionId);
+    if (currentTx && currentTx.category === nextCategory) {
+      cancelEditingTransaction();
+      return;
+    }
+
+    setIsSavingTransaction(true);
+    try {
+      await apiClient.updateTransaction(transactionId, { category: nextCategory });
+      setTransactions(prev =>
+        prev.map(tx => (tx.id === transactionId ? { ...tx, category: nextCategory } : tx))
+      );
+
+      await refreshDashboardData();
+      await loadTransactions();
+
+      setChangeSummary([{
+        message: 'Transaction category updated.',
+        status: 'success',
+        category: nextCategory,
+      }]);
+      setShowChangeBanner(true);
+      setTimeout(() => setShowChangeBanner(false), 5000);
+      cancelEditingTransaction();
+    } catch (error) {
+      console.error('Error updating transaction:', error);
+      setTransactionsError(error instanceof Error ? error.message : 'Failed to update transaction');
+      setChangeSummary([{
+        message: `Error updating transaction: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        status: 'error',
+        category: 'unknown',
+      }]);
+      setShowChangeBanner(true);
+    } finally {
+      setIsSavingTransaction(false);
+    }
+  };
+
   // Handler for mutate_categories tool call
   // Using discriminated union to properly type edit vs transfer operations
   const handleMutateCategories = async (
@@ -2739,17 +2810,12 @@ export const DashboardWidget: React.FC = () => {
       
       // TODO: Implement proper transaction updates based on operations
       // For now, just refresh the dashboard
-      const refreshData = await apiClient.getFinancialData({
+      await refreshDashboardData({
         bank_name: bankName || activeBankFilter,
         month_year: monthYear || activeMonthFilter,
       });
-
-      const refreshValidated = dashboardPropsSchema.safeParse(refreshData);
-      if (refreshValidated.success) {
-        setLocalDashboardData({ ...refreshValidated.data, initial_filters: null });
-        setSelectedMonths([]);
-        setSelectedBanks([]);
-      }
+      setSelectedMonths([]);
+      setSelectedBanks([]);
 
       // Show success message
       setChangeSummary([{
@@ -2810,14 +2876,9 @@ export const DashboardWidget: React.FC = () => {
       await apiClient.saveBudget(budgets);
 
       // Refresh dashboard to get updated budget data
-      const refreshData = await apiClient.getFinancialData();
-
-      const refreshValidated = dashboardPropsSchema.safeParse(refreshData);
-      if (refreshValidated.success) {
-        setLocalDashboardData({ ...refreshValidated.data, initial_filters: null });
-        setSelectedMonths([]);
-        setSelectedBanks([]);
-      }
+      await refreshDashboardData();
+      setSelectedMonths([]);
+      setSelectedBanks([]);
 
       setChangeSummary([{
         message: `Successfully saved ${budgets.length} budget(s)`,
@@ -3274,7 +3335,6 @@ export const DashboardWidget: React.FC = () => {
   }, [data?.coverage?.start, data?.coverage?.end]);
 
   const tabs: Array<{ id: TabType; label: string; icon?: string }> = [
-    { id: 'journey', label: 'Journey', icon: '🏔️' },
     { id: 'overview', label: 'Overview' },
     { id: 'cashflow', label: 'Cashflow P&L' },
     { id: 'trends', label: 'Trends' },
@@ -3480,18 +3540,6 @@ export const DashboardWidget: React.FC = () => {
               : ''}
           </div>
         </div>
-
-        {/* Journey Status Bar - Compact progress display */}
-        {progressState && activeTab !== 'journey' && (
-          <div style={{ marginTop: SPACING.md }}>
-            <StatusBar 
-              progress={progressState}
-              onJourneyClick={() => setActiveTab('journey')}
-              theme={theme}
-              compact={false}
-            />
-          </div>
-        )}
       </header>
 
       {/* Tabs */}
@@ -3527,22 +3575,8 @@ export const DashboardWidget: React.FC = () => {
         ))}
       </div>
 
-      {/* Confetti Celebration Effect */}
-      {showConfetti && <Confetti theme={theme} />}
-
       {/* Tab Content */}
-      <div style={{ padding: activeTab === 'journey' ? 0 : SPACING.xl }}>
-        {/* JOURNEY TAB */}
-        {activeTab === 'journey' && progressState && (
-          <div style={{ height: 'calc(100vh - 240px)', minHeight: 600 }}>
-            <JourneyPath 
-              progress={progressState}
-              onMilestoneClaim={handleMilestoneClaim}
-              theme={theme}
-            />
-          </div>
-        )}
-
+      <div style={{ padding: SPACING.xl }}>
         {/* OVERVIEW TAB */}
         {activeTab === 'overview' && (
           <div>
@@ -4784,6 +4818,219 @@ export const DashboardWidget: React.FC = () => {
                     </tr>
                   </tbody>
                 </table>
+              </div>
+            </Card>
+
+            <Card theme={theme} padding="md" style={{ marginTop: SPACING.lg }}>
+              <div
+                style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  gap: SPACING.md,
+                  flexWrap: 'wrap',
+                  marginBottom: SPACING.md,
+                }}
+              >
+                <div>
+                  <h3
+                    style={{
+                      margin: 0,
+                      fontSize: TYPOGRAPHY.sizes.lg,
+                      fontWeight: TYPOGRAPHY.weights.semibold,
+                      color: colors.text.primary,
+                    }}
+                  >
+                    Transactions
+                  </h3>
+                  <div style={{ fontSize: TYPOGRAPHY.sizes.xs, color: colors.text.secondary }}>
+                    {transactionsLoading ? 'Loading transactions...' : `${transactions.length} transactions`}
+                  </div>
+                </div>
+                <button
+                  onClick={loadTransactions}
+                  disabled={transactionsLoading}
+                  style={{
+                    padding: `${SPACING.sm}px ${SPACING.md}px`,
+                    fontSize: TYPOGRAPHY.sizes.sm,
+                    fontWeight: TYPOGRAPHY.weights.medium,
+                    color: colors.text.primary,
+                    background: colors.bg.secondary,
+                    border: `1px solid ${colors.border.default}`,
+                    borderRadius: 4,
+                    cursor: transactionsLoading ? 'not-allowed' : 'pointer',
+                    opacity: transactionsLoading ? 0.6 : 1,
+                  }}
+                >
+                  Refresh
+                </button>
+              </div>
+
+              {transactionsError && (
+                <div
+                  style={{
+                    padding: SPACING.sm,
+                    marginBottom: SPACING.md,
+                    background: colors.bg.subtle,
+                    color: colors.text.negative,
+                    borderRadius: 6,
+                    fontSize: TYPOGRAPHY.sizes.sm,
+                  }}
+                >
+                  {transactionsError}
+                </div>
+              )}
+
+              <div style={{ overflowX: 'auto', maxHeight: 520, border: `1px solid ${colors.border.default}`, borderRadius: 8 }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: TYPOGRAPHY.sizes.sm }}>
+                  <thead>
+                    <tr style={{ background: colors.bg.secondary }}>
+                      <th style={{ textAlign: 'left', padding: SPACING.sm, color: colors.text.secondary }}>Date</th>
+                      <th style={{ textAlign: 'left', padding: SPACING.sm, color: colors.text.secondary }}>Description</th>
+                      <th style={{ textAlign: 'left', padding: SPACING.sm, color: colors.text.secondary }}>Merchant</th>
+                      <th style={{ textAlign: 'right', padding: SPACING.sm, color: colors.text.secondary }}>Amount</th>
+                      <th style={{ textAlign: 'left', padding: SPACING.sm, color: colors.text.secondary }}>Category</th>
+                      <th style={{ textAlign: 'left', padding: SPACING.sm, color: colors.text.secondary }}>Bank</th>
+                      <th style={{ textAlign: 'left', padding: SPACING.sm, color: colors.text.secondary }}>Profile</th>
+                      <th style={{ textAlign: 'center', padding: SPACING.sm, color: colors.text.secondary }}>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {transactions.length === 0 && !transactionsLoading ? (
+                      <tr>
+                        <td colSpan={8} style={{ padding: SPACING.lg, textAlign: 'center', color: colors.text.secondary }}>
+                          No transactions found for the current filters.
+                        </td>
+                      </tr>
+                    ) : (
+                      transactions.map((tx, idx) => {
+                        const isEditing = editingTransactionId === tx.id;
+                        return (
+                          <tr
+                            key={tx.id}
+                            style={{
+                              background: idx % 2 === 0 ? colors.bg.primary : colors.bg.subtle,
+                              borderBottom: `1px solid ${colors.border.default}`,
+                            }}
+                          >
+                            <td style={{ padding: SPACING.sm, whiteSpace: 'nowrap' }}>
+                              {formatDate(tx.date)}
+                            </td>
+                            <td style={{ padding: SPACING.sm, minWidth: 200 }}>
+                              {tx.description}
+                            </td>
+                            <td style={{ padding: SPACING.sm, minWidth: 140 }}>
+                              {tx.merchant || '-'}
+                            </td>
+                            <td
+                              style={{
+                                padding: SPACING.sm,
+                                textAlign: 'right',
+                                color: tx.amount < 0 ? colors.text.negative : colors.text.primary,
+                                whiteSpace: 'nowrap',
+                              }}
+                            >
+                              {formatCurrency(tx.amount, currency)}
+                            </td>
+                            <td style={{ padding: SPACING.sm, minWidth: 160 }}>
+                              {isEditing ? (
+                                <>
+                                  <input
+                                    type="text"
+                                    value={editingTransactionCategory}
+                                    list="transaction-category-options"
+                                    onChange={(e) => setEditingTransactionCategory(e.target.value)}
+                                    onKeyDown={(e) => {
+                                      if (e.key === 'Enter') {
+                                        handleSaveTransactionCategory(tx.id);
+                                      }
+                                      if (e.key === 'Escape') {
+                                        cancelEditingTransaction();
+                                      }
+                                    }}
+                                    style={{
+                                      width: '100%',
+                                      padding: `${SPACING.xs}px ${SPACING.sm}px`,
+                                      borderRadius: 4,
+                                      border: `1px solid ${colors.border.default}`,
+                                      background: colors.bg.primary,
+                                      color: colors.text.primary,
+                                    }}
+                                  />
+                                </>
+                              ) : (
+                                tx.category
+                              )}
+                            </td>
+                            <td style={{ padding: SPACING.sm }}>{tx.bank_name || '-'}</td>
+                            <td style={{ padding: SPACING.sm }}>{tx.profile || '-'}</td>
+                            <td style={{ padding: SPACING.sm, textAlign: 'center', whiteSpace: 'nowrap' }}>
+                              {isEditing ? (
+                                <>
+                                  <button
+                                    onClick={() => handleSaveTransactionCategory(tx.id)}
+                                    disabled={isSavingTransaction}
+                                    style={{
+                                      padding: `${SPACING.xs}px ${SPACING.sm}px`,
+                                      fontSize: TYPOGRAPHY.sizes.xs,
+                                      background: colors.primary,
+                                      color: colors.bg.primary,
+                                      border: 'none',
+                                      borderRadius: 4,
+                                      cursor: isSavingTransaction ? 'not-allowed' : 'pointer',
+                                      opacity: isSavingTransaction ? 0.6 : 1,
+                                      marginRight: SPACING.xs,
+                                    }}
+                                  >
+                                    Save
+                                  </button>
+                                  <button
+                                    onClick={cancelEditingTransaction}
+                                    disabled={isSavingTransaction}
+                                    style={{
+                                      padding: `${SPACING.xs}px ${SPACING.sm}px`,
+                                      fontSize: TYPOGRAPHY.sizes.xs,
+                                      background: colors.bg.secondary,
+                                      color: colors.text.primary,
+                                      border: `1px solid ${colors.border.default}`,
+                                      borderRadius: 4,
+                                      cursor: isSavingTransaction ? 'not-allowed' : 'pointer',
+                                      opacity: isSavingTransaction ? 0.6 : 1,
+                                    }}
+                                  >
+                                    Cancel
+                                  </button>
+                                </>
+                              ) : (
+                                <button
+                                  onClick={() => startEditingTransaction(tx)}
+                                  disabled={isSavingTransaction}
+                                  style={{
+                                    padding: `${SPACING.xs}px ${SPACING.sm}px`,
+                                    fontSize: TYPOGRAPHY.sizes.xs,
+                                    background: colors.bg.secondary,
+                                    color: colors.text.primary,
+                                    border: `1px solid ${colors.border.default}`,
+                                    borderRadius: 4,
+                                    cursor: isSavingTransaction ? 'not-allowed' : 'pointer',
+                                    opacity: isSavingTransaction ? 0.6 : 1,
+                                  }}
+                                >
+                                  Edit
+                                </button>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })
+                    )}
+                  </tbody>
+                </table>
+                <datalist id="transaction-category-options">
+                  {(currentPivot?.categories || []).map(category => (
+                    <option key={category} value={category} />
+                  ))}
+                </datalist>
               </div>
             </Card>
 

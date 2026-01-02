@@ -1,0 +1,22 @@
+[
+  {"id": 1, "category": "Income"},
+  {"id": 2, "category": "Food & Groceries"},
+  {"id": 3, "category": "Healthcare"},
+  {"id": 4, "category": "Other"},
+  {"id": 5, "category": "Other"},
+  {"id": 6, "category": "Food & Groceries"},
+  {"id": 7, "category": "Food & Groceries"},
+  {"id": 8, "category": "Shopping"},
+  {"id": 9, "category": "Entertainment"},
+  {"id": 10, "category": "Other"},
+  {"id": 11, "category": "Food & Groceries"},
+  {"id": 12, "category": "Entertainment"},
+  {"id": 13, "category": "Food & Groceries"},
+  {"id": 14, "category": "Food & Groceries"},
+  {"id": 15, "category": "Food & Groceries"},
+  {"id": 16, "category": "Other"},
+  {"id": 17, "category": "Food & Groceries"},
+  {"id": 18, "category": "Food & Groceries"},
+  {"id": 19, "category": "Food & Groceries"},
+  {"id": 20, "category": "Food & Groceries"}
+]

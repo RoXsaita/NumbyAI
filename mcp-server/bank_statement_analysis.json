@@ -1,0 +1,28 @@
+{
+  "columns_found": [
+    "Column 0",
+    "Column 1",
+    "Column 2",
+    "Column 3",
+    "Column 4",
+    "Column 5",
+    "Column 6",
+    "Column 7",
+    "Column 8",
+    "Column 9"
+  ],
+  "date_column": "Column 0",
+  "description_column": "Column 2",
+  "amount_column": "Column 6",
+  "balance_column": "Column 7",
+  "date_format": "DD-MM-YYYY",
+  "currency": "PLN",
+  "has_headers": false,
+  "skip_rows": 1,
+  "amount_positive_is": "credit",
+  "questions": [
+    "Found two date columns: Column 0 (posting date) and Column 1 (value date). Should we use Column 0 for transaction dates?",
+    "The amount column uses comma as decimal separator (European format, e.g., '10804,79', '-21,92'). Should the parser convert these to standard decimal format (e.g., '10804.79', '-21.92')?"
+  ],
+  "confidence": "high"
+}

@@ -82,21 +82,21 @@ def _aggregate_transactions_to_summaries(
     
     # Convert to CategorySummary-like objects
     summaries = []
-    for (bank_name, month_year, category, profile), data in grouped.items():
-        # Create a minimal CategorySummary-like object
-        # We'll use a simple object that has the same attributes
-        class SummaryLike:
-            def __init__(self):
-                self.bank_name = bank_name
-                self.month_year = month_year
-                self.category = category
-                self.amount = data['amount']
-                self.currency = data['currency']
-                self.transaction_count = data['count']
-                self.profile = data['profile']
-                self.insights = None
-        
-        summary = SummaryLike()
+
+    class SummaryLike:
+        def __init__(self, summary_id, bank_name, month_year, category, data):
+            self.id = summary_id
+            self.bank_name = bank_name
+            self.month_year = month_year
+            self.category = category
+            self.amount = data['amount']
+            self.currency = data['currency']
+            self.transaction_count = data['count']
+            self.profile = data['profile']
+            self.insights = None
+
+    for idx, ((bank_name, month_year, category, profile), data) in enumerate(grouped.items(), start=1):
+        summary = SummaryLike(idx, bank_name, month_year, category, data)
         summaries.append(summary)
     
     return summaries
@@ -528,8 +528,9 @@ def _build_dashboard_props(
         if month_filter
         else (latest_month if len(sorted_months) == 1 else "Multi-period")
     )
+    summary_id = getattr(summaries[0], "id", "no_id")
     statement = Statement(
-        id=f"pivot_{summaries[0].id}",
+        id=f"pivot_{summary_id}",
         month=statement_month or "Multi-period",
         bank=bank_name or (sorted_banks[0] if sorted_banks else None),
         currency=currency,

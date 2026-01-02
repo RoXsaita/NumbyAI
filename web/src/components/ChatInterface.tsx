@@ -69,6 +69,7 @@ export const ChatInterface: React.FC = () => {
     };
 
     setMessages(prev => [...prev, userMessage]);
+    const messageText = input;
     setInput('');
     setIsStreaming(true);
 
@@ -102,15 +103,46 @@ export const ChatInterface: React.FC = () => {
         }
         setUploadedFile(null);
         setNetFlow('');
+        setIsStreaming(false);
       } else {
-        // Regular chat message
-        const response = await apiClient.sendChatMessage(input);
+        // Regular chat message - use streaming
+        const assistantMessageId = (Date.now() + 1).toString();
+        let accumulatedContent = '';
+
+        // Create placeholder assistant message
         setMessages(prev => [...prev, {
-          id: (Date.now() + 1).toString(),
+          id: assistantMessageId,
           role: 'assistant',
-          content: response.response,
+          content: '',
           type: 'text',
         }]);
+
+        // Stream response
+        await apiClient.streamChatResponse(
+          messageText,
+          (chunk: string) => {
+            // Update message with accumulated content
+            accumulatedContent += chunk;
+            setMessages(prev => prev.map(msg => 
+              msg.id === assistantMessageId
+                ? { ...msg, content: accumulatedContent }
+                : msg
+            ));
+          },
+          () => {
+            // Streaming complete
+            setIsStreaming(false);
+          },
+          (error: string) => {
+            // Error occurred
+            setMessages(prev => prev.map(msg => 
+              msg.id === assistantMessageId
+                ? { ...msg, content: `Error: ${error}` }
+                : msg
+            ));
+            setIsStreaming(false);
+          }
+        );
       }
     } catch (error) {
       setMessages(prev => [...prev, {
@@ -119,7 +151,6 @@ export const ChatInterface: React.FC = () => {
         content: `Error: ${error instanceof Error ? error.message : 'Unknown error'}`,
         type: 'text',
       }]);
-    } finally {
       setIsStreaming(false);
     }
   };
@@ -128,7 +159,7 @@ export const ChatInterface: React.FC = () => {
     <div style={{
       display: 'flex',
       flexDirection: 'column',
-      height: '100vh',
+      height: 'calc(100vh - 56px)',
       backgroundColor: '#f5f5f5',
     }}>
       {/* Messages area */}

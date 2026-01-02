@@ -1,0 +1,28 @@
+{
+    "columns_found": [
+        "Column 0 (Transaction Date)",
+        "Column 1 (Value Date)",
+        "Column 2 (Description)",
+        "Column 3 (Additional Description/Recipient)",
+        "Column 4 (Account Number)",
+        "Column 5 (Amount)",
+        "Column 6 (Balance)",
+        "Column 7 (Index/Counter)",
+        "Column 8 (Unnamed)"
+    ],
+    "date_column": "Column 0",
+    "description_column": "Column 2",
+    "amount_column": "Column 5",
+    "balance_column": "Column 6",
+    "date_format": "DD-MM-YYYY",
+    "currency": "PLN",
+    "has_headers": false,
+    "skip_rows": 1,
+    "amount_positive_is": "credit",
+    "questions": [
+        "Should we use Column 0 (Transaction Date) or Column 1 (Value Date) for the transaction date? Column 0 appears to be the posting date and Column 1 appears to be the value date.",
+        "The amount column uses comma as decimal separator (e.g., '10804,79'). The parser should handle this correctly, but please confirm.",
+        "Some rows have account numbers in Column 4. Should we extract this information or ignore it?"
+    ],
+    "confidence": "high"
+}
