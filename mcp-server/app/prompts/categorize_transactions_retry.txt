@@ -1,0 +1,21 @@
+Categorize these bank transactions into the predefined categories.
+
+Available categories:
+{{categories}}
+{{rules}}
+
+Transactions to categorize:
+{{transactions}}
+
+For each transaction:
+1. Use the description, merchant, and vendor_payee to determine the best category
+2. Do NOT return "Other" unless you are absolutely certain nothing fits
+3. Assign exactly one category per transaction
+
+Return JSON array with this structure:
+[
+  {"id": 1, "category": "Food & Groceries"},
+  {"id": 2, "category": "Transportation"}
+]
+
+Each transaction must have an "id" field matching the transaction ID and a "category" field with one of the predefined categories.

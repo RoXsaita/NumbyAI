@@ -1,0 +1,13 @@
+- Income: salary, wages, bonuses, interest, dividends
+- Housing & Utilities: rent, utilities, internet, phone
+- Food & Groceries: groceries, restaurants, coffee, food delivery
+- Transportation: gas, transit, car payment, parking, rideshare
+- Insurance: health, car, home, life insurance premiums
+- Healthcare: medical bills, prescriptions, dental, vision
+- Shopping: retail, clothing, electronics, household items, refunds
+- Entertainment: movies, subscriptions, hobbies, gym
+- Travel: flights, hotels, vacation expenses
+- Debt Payments: credit card payments, loans (excluding auto/mortgage)
+- Internal Transfers: own-account transfers, currency exchanges, linked deposits
+- Investments: stock purchases, retirement contributions, brokerage transfers
+- Other: anything else

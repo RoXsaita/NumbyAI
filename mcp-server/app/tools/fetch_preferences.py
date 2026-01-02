@@ -2,7 +2,10 @@
 from collections import defaultdict
 from typing import Optional, List, Dict, Any, Literal, Union
 
-from app.database import CategorizationPreference, CategorySummary, Budget, SessionLocal, resolve_user_id
+from sqlalchemy import func
+
+from app.config import settings
+from app.database import CategorizationPreference, CategorySummary, Budget, SessionLocal, Transaction, resolve_user_id
 from app.logger import create_logger, ErrorType
 from app.tools.phase_instructions import (
     determine_user_phase,
@@ -17,6 +20,12 @@ PreferenceType = Literal["categorization", "parsing", "settings", "list"]
 
 # Settings preference name constant (only one settings record per user)
 SETTINGS_PREFERENCE_NAME = "user_settings"
+
+
+def _month_year_expr():
+    if settings.database_url.startswith("sqlite"):
+        return func.strftime("%Y-%m", Transaction.date)
+    return func.to_char(Transaction.date, "YYYY-MM")
 
 
 async def fetch_preferences_handler(
@@ -343,21 +352,53 @@ async def _fetch_multiple_preferences(
 
 async def _build_data_overview(db, user_id: str) -> dict:
     """Build a detailed overview of user's saved data."""
-    # Get all category summaries for this user
-    summaries = db.query(CategorySummary).filter(
-        CategorySummary.user_id == user_id
-    ).all()
-    
-    if not summaries:
-        return {
-            "banks": [],
-            "total_months": 0,
-            "date_range": None,
-            "categories_used": [],
-            "budgets_configured": 0,
-            "profiles_in_use": [],
-        }
-    
+    month_expr = _month_year_expr()
+    transaction_rows = (
+        db.query(
+            Transaction.bank_name.label("bank_name"),
+            month_expr.label("month_year"),
+            Transaction.category.label("category"),
+            Transaction.profile.label("profile"),
+        )
+        .filter(Transaction.user_id == user_id)
+        .distinct()
+        .all()
+    )
+
+    records: List[Dict[str, Any]] = []
+    if transaction_rows:
+        records = [
+            {
+                "bank_name": row.bank_name,
+                "month_year": row.month_year,
+                "category": row.category,
+                "profile": row.profile,
+            }
+            for row in transaction_rows
+        ]
+    else:
+        summaries = db.query(CategorySummary).filter(
+            CategorySummary.user_id == user_id
+        ).all()
+        if not summaries:
+            return {
+                "banks": [],
+                "total_months": 0,
+                "date_range": None,
+                "categories_used": [],
+                "budgets_configured": 0,
+                "profiles_in_use": [],
+            }
+        records = [
+            {
+                "bank_name": s.bank_name,
+                "month_year": s.month_year,
+                "category": s.category,
+                "profile": s.profile,
+            }
+            for s in summaries
+        ]
+
     # Aggregate bank data
     bank_data: Dict[str, Dict[str, Any]] = defaultdict(lambda: {
         "months": set(),
@@ -366,14 +407,18 @@ async def _build_data_overview(db, user_id: str) -> dict:
     all_months = set()
     all_categories = set()
     all_profiles = set()
-    
-    for s in summaries:
-        bank_data[s.bank_name]["months"].add(s.month_year)
-        if s.profile:
-            bank_data[s.bank_name]["profiles"].add(s.profile)
-            all_profiles.add(s.profile)
-        all_months.add(s.month_year)
-        all_categories.add(s.category)
+
+    for record in records:
+        bank_name = record["bank_name"]
+        month_year = record["month_year"]
+        category = record["category"]
+        profile = record["profile"]
+        bank_data[bank_name]["months"].add(month_year)
+        if profile:
+            bank_data[bank_name]["profiles"].add(profile)
+            all_profiles.add(profile)
+        all_months.add(month_year)
+        all_categories.add(category)
     
     # Count budgets
     budget_count = db.query(Budget).filter(Budget.user_id == user_id).count()

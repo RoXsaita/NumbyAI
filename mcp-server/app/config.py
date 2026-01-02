@@ -33,6 +33,8 @@ class Settings(BaseSettings):
     # Cursor Agent integration
     cursor_api_key: Optional[str] = None  # Optional, for headless mode
     cursor_agent_path: str = "cursor-agent"  # Default: "cursor-agent", can be full path
+    categorization_batch_size: int = 20
+    categorization_max_workers: int = 5
     
     class Config:
         env_file = ".env"

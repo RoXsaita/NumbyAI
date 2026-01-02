@@ -202,23 +202,23 @@ def parse_csv_statement(file_path: str, schema: Dict) -> List[Dict]:
                         inflow_str = str(row[inflow_col_name]).strip()
                         if inflow_str and inflow_str != 'nan' and inflow_str != 'None' and inflow_str:
                             try:
-                                inflow = float(_parse_amount(inflow_str))
-                            except:
+                                inflow = _parse_amount(inflow_str)
+                            except Exception:
                                 inflow = None
                     if outflow_col_name and pd.notna(row.get(outflow_col_name)):
                         outflow_str = str(row[outflow_col_name]).strip()
                         if outflow_str and outflow_str != 'nan' and outflow_str != 'None' and outflow_str:
                             try:
-                                outflow = float(_parse_amount(outflow_str))
-                            except:
+                                outflow = _parse_amount(outflow_str)
+                            except Exception:
                                 outflow = None
                     # Calculate amount from inflow/outflow
                     if inflow is not None and outflow is not None:
-                        amount = Decimal(str(inflow - outflow))
+                        amount = inflow - outflow
                     elif inflow is not None:
-                        amount = Decimal(str(inflow))
+                        amount = inflow
                     elif outflow is not None:
-                        amount = Decimal(str(-outflow))
+                        amount = -outflow
                     else:
                         amount = Decimal('0')
                 else:
@@ -234,11 +234,11 @@ def parse_csv_statement(file_path: str, schema: Dict) -> List[Dict]:
                     
                     # Set inflow/outflow based on amount
                     if amount > 0:
-                        inflow = float(amount)
+                        inflow = amount
                         outflow = None
                     elif amount < 0:
                         inflow = None
-                        outflow = float(abs(amount))
+                        outflow = abs(amount)
                     else:
                         inflow = None
                         outflow = None
@@ -268,10 +268,10 @@ def parse_csv_statement(file_path: str, schema: Dict) -> List[Dict]:
                     'vendor_payee': vendor_payee,
                     'description': description,
                     'category': category,
-                    'amount': float(amount) if amount is not None else 0.0,
-                    'inflow': float(inflow) if inflow is not None else None,
-                    'outflow': float(outflow) if outflow is not None else None,
-                    'balance': float(balance) if balance is not None else None,
+                    'amount': amount if amount is not None else Decimal('0'),
+                    'inflow': inflow,
+                    'outflow': outflow,
+                    'balance': balance,
                     'currency': transaction_currency,
                 }
                 
@@ -415,6 +415,12 @@ def _parse_amount(amount_str: str) -> Decimal:
         raise ValueError(f"Could not parse amount: {amount_str}")
 
 
+def _coerce_decimal(value: object) -> Decimal:
+    if isinstance(value, Decimal):
+        return value
+    return Decimal(str(value))
+
+
 def extract_merchant(description: str) -> str:
     """
     Extract merchant name from transaction description.
@@ -493,17 +499,25 @@ def normalize_transaction(raw_tx: Dict, schema: Dict) -> Dict:
     if 'amount' not in raw_tx or raw_tx['amount'] is None:
         raise ValueError("Transaction missing amount")
     
-    # Extract merchant
-    merchant = extract_merchant(raw_tx['description'])
+    # Extract merchant (prefer vendor/payee if present)
+    vendor_payee = raw_tx.get('vendor_payee')
+    merchant = vendor_payee.strip() if isinstance(vendor_payee, str) and vendor_payee.strip() else extract_merchant(raw_tx['description'])
     
+    amount = _coerce_decimal(raw_tx["amount"])
+    balance = raw_tx.get("balance")
+    if balance is not None and not isinstance(balance, Decimal):
+        balance = _coerce_decimal(balance)
+
     # Build normalized transaction
     normalized = {
         'date': raw_tx['date'],
         'description': raw_tx['description'].strip(),
         'merchant': merchant,
-        'amount': float(raw_tx['amount']),
+        'vendor_payee': vendor_payee.strip() if isinstance(vendor_payee, str) and vendor_payee.strip() else None,
+        'category': raw_tx.get('category'),
+        'amount': amount,
         'currency': raw_tx.get('currency', schema.get('currency', 'USD')),
-        'balance': raw_tx.get('balance'),
+        'balance': balance,
     }
     
     return normalized

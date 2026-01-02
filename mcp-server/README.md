@@ -78,8 +78,8 @@ uvicorn app.main:app --reload --port 8000
 
 ```bash
 # Run tool tests
-python -m pytest test_*.py -v
+python -m pytest tests -v
 
 # Run QA script
-python test_preferences_qa.py
+python tests/test_preferences_qa.py
 ```

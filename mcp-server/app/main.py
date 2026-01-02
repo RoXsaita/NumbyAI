@@ -4,8 +4,11 @@ import json
 import os
 import textwrap
 import traceback
+import asyncio
+import queue
+import threading
 from pathlib import Path
-from typing import Any, Dict, Optional, List, Union
+from typing import Any, Dict, Optional, List, Union, Callable
 from urllib.parse import urlparse
 
 
@@ -14,17 +17,18 @@ from mcp.types import TextContent
 from mcp.server.fastmcp import FastMCP
 from starlette.responses import JSONResponse, HTMLResponse, StreamingResponse
 from starlette.requests import Request
-from fastapi import UploadFile, File, Form
+from fastapi import UploadFile, File, Form, HTTPException
 from dotenv import load_dotenv
 import shutil
-from datetime import datetime
+from datetime import datetime, timedelta, date
+from decimal import Decimal
 import uuid
 
 from app.config import settings
 from app.logger import create_logger
 from app.tools.save_statement_summary import save_statement_summary_handler
 from app.tools.financial_data import get_financial_data_handler
-from app.tools.category_helpers import PREDEFINED_CATEGORIES
+from app.tools.category_helpers import PREDEFINED_CATEGORIES, normalize_category
 from app.tools.fetch_preferences import fetch_preferences_handler
 from app.tools.save_preferences import save_preferences_handler
 from app.tools.mutate_categories import mutate_categories_handler
@@ -46,6 +50,10 @@ from app.services.cursor_agent_service import (
     categorize_transactions_batch,
     learn_merchant_rules
 )
+from app.services.categorization_rules import (
+    CategorizationRule,
+    apply_categorization_rules,
+)
 from app.services.statement_analyzer import (
     check_existing_parsing_preferences,
     analyze_statement_structure_from_file,
@@ -54,20 +62,19 @@ from app.services.statement_analyzer import (
 )
 from app.tools.statement_parser import (
     parse_csv_statement,
-    extract_merchant,
     normalize_transaction
 )
 from app.database import (
     SessionLocal,
     Transaction,
-    CategorizationRule,
+    CategorizationPreference,
     User,
     resolve_user_id,
     get_or_create_test_user
 )
 from app.auth import oauth2_auth
+from app.security import hash_password, verify_password
 from jose import jwt
-from datetime import datetime, timedelta
 
 load_dotenv()
 
@@ -79,6 +86,49 @@ IS_DEBUG = os.getenv("ENVIRONMENT", "").lower() != "production"
 
 # Validate production settings on startup
 settings.validate_production_settings()
+
+
+async def resolve_request_user_id(request: Request, require_auth: bool = False) -> str:
+    """Resolve user_id from Authorization header or fall back to test user."""
+    authorization = request.headers.get("Authorization")
+    token_payload = None
+    if oauth2_auth.is_enabled():
+        try:
+            token_payload = await oauth2_auth.validate_token(authorization)
+        except HTTPException:
+            if require_auth:
+                raise
+    elif require_auth and not authorization:
+        return get_or_create_test_user()
+    if token_payload and token_payload.get("sub"):
+        return str(token_payload["sub"])
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.split(" ")[1]
+        try:
+            payload = jwt.decode(token, settings.secret_key, algorithms=["HS256"])
+            if payload.get("sub"):
+                return str(payload["sub"])
+        except Exception:
+            if require_auth:
+                raise HTTPException(status_code=401, detail="Invalid token")
+    if require_auth:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return get_or_create_test_user()
+
+
+def _serialize_transactions_for_json(transactions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    serialized = []
+    for tx in transactions:
+        serialized_tx: Dict[str, Any] = {}
+        for key, value in tx.items():
+            if isinstance(value, Decimal):
+                serialized_tx[key] = float(value)
+            elif isinstance(value, (datetime, date)):
+                serialized_tx[key] = value.isoformat()
+            else:
+                serialized_tx[key] = value
+        serialized.append(serialized_tx)
+    return serialized
 
 MCP_SERVER_DESCRIPTION = """
 Finance Budgeting App - parse, analyze, categorize, and save category summaries from bank statements.
@@ -314,9 +364,7 @@ async def test_widget(request):
         
         # Inject real database data for widgets
         if widget_name == "dashboard":
-            from app.database import get_or_create_test_user
-
-            user_id = get_or_create_test_user()
+            user_id = await resolve_request_user_id(request)
             result = get_financial_data_handler(user_id=user_id)
 
             # Get _meta (full payload for widget) and structuredContent (lighter for AI)
@@ -927,7 +975,7 @@ async def send_chat_message(request: Request):
         
         # Get or create user
         if not user_id:
-            user_id = get_or_create_test_user()
+            user_id = await resolve_request_user_id(request)
         
         # Get conversation history for this user
         history = _conversation_history.get(user_id, [])
@@ -982,7 +1030,7 @@ async def stream_chat_response(request: Request):
     user_id = request.query_params.get("user_id")
     
     if not user_id:
-        user_id = get_or_create_test_user()
+        user_id = await resolve_request_user_id(request)
     
     # Get conversation history
     history = _conversation_history.get(user_id, [])
@@ -1031,7 +1079,7 @@ async def stream_chat_response(request: Request):
 async def upload_statement(request: Request):
     """Upload and parse bank statement (CSV/Excel) - Enhanced with validation info"""
     try:
-        user_id = get_or_create_test_user()  # TODO: Get from auth
+        user_id = await resolve_request_user_id(request, require_auth=True)
         
         # Handle multipart form data
         form = await request.form()
@@ -1109,11 +1157,12 @@ async def upload_statement(request: Request):
                 except Exception as e:
                     logger.warn("Failed to read preview data for existing bank", {"error": str(e)})
                 
+                preview_transactions = _serialize_transactions_for_json(transactions)
                 return JSONResponse({
                     "job_id": str(uuid.uuid4()),
                     "status": "ready_to_process",
                     "transactions_count": len(transactions),
-                    "transactions": transactions[:10],  # Return first 10 for preview
+                    "transactions": preview_transactions[:10],  # Return first 10 for preview
                     "currency_detected": existing_schema.get("currency"),
                     "currency_required": not bool(user_currency),
                     "parsing_preferences_exist": True,
@@ -1178,9 +1227,353 @@ async def upload_statement(request: Request):
             "saved_mappings": saved_mappings  # Include saved mappings for auto-population
         })
         
+    except HTTPException as e:
+        return JSONResponse({"error": e.detail}, status_code=e.status_code)
     except Exception as e:
         logger.error("File upload error", {"error": str(e)})
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def process_statement_pipeline(
+    file_path: Path,
+    bank_name: Optional[str],
+    net_flow: Optional[float],
+    header_mapping: Optional[str],
+    user_id: str,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None
+) -> Dict[str, Any]:
+    def emit_progress(payload: Dict[str, Any]) -> None:
+        if not progress_callback:
+            return
+        try:
+            progress_callback(payload)
+        except Exception as e:
+            logger.warn("Progress callback failed", {"error": str(e)})
+
+    # Step 2: Get or create parsing schema
+    schema = None
+    if bank_name:
+        schema = check_existing_parsing_preferences(bank_name, user_id)
+
+    if not schema:
+        # Check if header mapping was provided from frontend
+        if header_mapping:
+            try:
+                mapping_data = json.loads(header_mapping)
+                # Get user currency
+                from app.database import CategorizationPreference
+                db = SessionLocal()
+                try:
+                    settings_pref = db.query(CategorizationPreference).filter(
+                        CategorizationPreference.user_id == user_id,
+                        CategorizationPreference.preference_type == "settings",
+                        CategorizationPreference.name == "user_settings",
+                        CategorizationPreference.enabled.is_(True)
+                    ).first()
+                    currency = "USD"
+                    if settings_pref and settings_pref.rule:
+                        currency = settings_pref.rule.get("functional_currency", "USD")
+                finally:
+                    db.close()
+
+                # Build schema from user mapping (new structure with column_mappings dict)
+                column_mappings = mapping_data.get("column_mappings", {})
+                if not column_mappings:
+                    # Fallback: try to build from old format
+                    description_col = mapping_data.get("description_column", "")
+                    if isinstance(description_col, str):
+                        description_col = [description_col] if description_col else []
+                    elif not isinstance(description_col, list):
+                        description_col = []
+                    column_mappings = {
+                        "date": mapping_data.get("date_column", ""),
+                        "description": description_col,
+                        "amount": mapping_data.get("amount_column", ""),
+                    }
+                    if mapping_data.get("balance_column"):
+                        column_mappings["balance"] = mapping_data["balance_column"]
+
+                schema = {
+                    "column_mappings": column_mappings,
+                    "date_format": mapping_data.get("date_format", "DD/MM/YYYY"),
+                    "currency": currency,
+                    "has_headers": False,  # Always false - we use first_transaction_row instead
+                    "skip_rows": 0,  # Will be calculated from first_transaction_row in parser
+                    "first_transaction_row": mapping_data.get("first_transaction_row", 1),
+                    "amount_positive_is": "debit",
+                }
+
+                logger.info("Built parsing schema from header mapping", {
+                    "bank_name": bank_name,
+                    "column_mappings": column_mappings,
+                    "column_mappings_types": {k: type(v).__name__ for k, v in column_mappings.items()},
+                    "first_transaction_row": schema["first_transaction_row"]
+                })
+
+                # Save schema for future use
+                if bank_name:
+                    save_parsing_schema(schema, bank_name, user_id)
+            except json.JSONDecodeError:
+                logger.warn("Failed to parse header_mapping, falling back to analysis")
+                schema = None
+
+        if not schema:
+            # Auto-analyze structure (use AI to detect format)
+            logger.info("No existing schema, analyzing statement structure")
+            analysis = analyze_statement_structure_from_file(str(file_path), user_id)
+
+            # Auto-build schema from analysis (use defaults for missing info)
+            schema = build_parsing_schema(analysis, {})
+
+            # Save schema for future use
+            if bank_name:
+                save_parsing_schema(schema, bank_name, user_id)
+
+    # Step 3: Parse transactions
+    transactions = parse_csv_statement(str(file_path), schema)
+    logger.info(f"Parsed {len(transactions)} transactions")
+
+    if not transactions:
+        raise ValueError("No transactions found in statement")
+
+    emit_progress({
+        "type": "stage",
+        "name": "parsed",
+        "transactions": len(transactions),
+    })
+
+    # Step 4: Normalize transactions (extract merchant, etc.)
+    normalized_txs = []
+    for tx in transactions:
+        normalized = normalize_transaction(tx, schema)
+        if normalized.get("category"):
+            normalized["category"] = normalize_category(str(normalized["category"])) or None
+        normalized_txs.append(normalized)
+
+    # Step 5: Get existing categorization preferences
+    db = SessionLocal()
+    try:
+        pref_query = db.query(CategorizationPreference).filter(
+            CategorizationPreference.user_id == user_id,
+            CategorizationPreference.preference_type == "categorization",
+            CategorizationPreference.enabled.is_(True)
+        )
+        if bank_name:
+            pref_query = pref_query.filter(
+                (CategorizationPreference.bank_name == bank_name)
+                | (CategorizationPreference.bank_name.is_(None))
+            )
+        pref_query = pref_query.order_by(
+            CategorizationPreference.bank_name.is_(None),
+            CategorizationPreference.priority.desc(),
+            CategorizationPreference.updated_at.desc()
+        )
+        preferences = pref_query.all()
+        existing_rules = [
+            CategorizationRule(
+                id=str(pref.id),
+                name=pref.name,
+                bank_name=pref.bank_name,
+                priority=pref.priority,
+                rule=pref.rule,
+            )
+            for pref in preferences
+        ]
+    finally:
+        db.close()
+
+    # Step 6: Categorize transactions using AI (in parallel batches)
+    # Add IDs to transactions for categorization
+    tx_with_ids = [
+        {**tx, "id": idx + 1}
+        for idx, tx in enumerate(normalized_txs)
+    ]
+
+    # Apply deterministic rules before AI categorization
+    rule_category_map, uncategorized = apply_categorization_rules(tx_with_ids, existing_rules)
+
+    batch_size = settings.categorization_batch_size
+    logger.info("Starting parallel categorization", {
+        "transaction_count": len(tx_with_ids),
+        "batch_size": batch_size,
+        "max_workers": settings.categorization_max_workers
+    })
+
+    categorized = []
+    if uncategorized:
+        categorized = categorize_transactions_batch(
+            uncategorized,
+            user_id,
+            existing_rules,
+            batch_size=batch_size,
+            parallel=True,
+            max_workers=settings.categorization_max_workers,
+            progress_callback=emit_progress
+        )
+
+    # Create mapping of ID to category
+    llm_category_map = {item["id"]: item["category"] for item in categorized}
+
+    # Retry "Other" assignments if they dominate the uncategorized set
+    if uncategorized:
+        other_ids = [tx_id for tx_id, cat in llm_category_map.items() if cat == "Other"]
+        if other_ids and len(other_ids) / len(uncategorized) > 0.4:
+            retry_txs = [tx for tx in uncategorized if tx.get("id") in other_ids]
+            retry_results = categorize_transactions_batch(
+                retry_txs,
+                user_id,
+                existing_rules,
+                batch_size=batch_size,
+                parallel=False,
+                max_workers=1,
+                progress_callback=emit_progress,
+                prompt_variant="retry"
+            )
+            for item in retry_results:
+                if item.get("category") and item["category"] != "Other":
+                    llm_category_map[item["id"]] = item["category"]
+
+    category_map = {**rule_category_map, **llm_category_map}
+    for tx in tx_with_ids:
+        tx_id = tx["id"]
+        if tx_id not in category_map:
+            category_map[tx_id] = "Other"
+
+    # Step 6.5: Save individual transactions to database
+    logger.info("Saving individual transactions to database", {
+        "transaction_count": len(normalized_txs),
+        "bank_name": bank_name
+    })
+
+    db_save = SessionLocal()
+    try:
+        created_transactions = []
+        for idx, tx in enumerate(normalized_txs):
+            tx_id = idx + 1
+            category = category_map.get(tx_id, "Other")
+
+            # Convert date to date object if it's a string
+            tx_date = tx["date"]
+            if isinstance(tx_date, str):
+                from datetime import datetime as dt
+                tx_date = dt.fromisoformat(tx_date).date()
+
+            amount_value = tx.get("amount")
+            if not isinstance(amount_value, Decimal):
+                amount_value = Decimal(str(amount_value))
+
+            transaction = Transaction(
+                user_id=user_id,
+                date=tx_date,
+                description=tx["description"],
+                merchant=tx.get("merchant"),
+                amount=amount_value,
+                currency=tx.get("currency", schema.get("currency", "USD")),
+                category=category,
+                bank_name=bank_name or "Unknown",
+                profile=None,  # Can be added later if needed
+            )
+            db_save.add(transaction)
+            created_transactions.append(transaction)
+
+        db_save.commit()
+        logger.info(f"Saved {len(normalized_txs)} transactions to database", {
+            "bank_name": bank_name,
+            "user_id": user_id
+        })
+        learn_merchant_rules(created_transactions, db_save, bank_name=bank_name)
+    except Exception as e:
+        db_save.rollback()
+        logger.error("Failed to save transactions to database", {
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        })
+        raise
+    finally:
+        db_save.close()
+
+    emit_progress({
+        "type": "stage",
+        "name": "transactions_saved",
+        "transactions": len(normalized_txs),
+    })
+
+    # Step 7: Aggregate by category
+    from collections import defaultdict
+    from datetime import datetime as dt
+    category_totals = defaultdict(lambda: Decimal("0"))
+    category_counts = defaultdict(int)
+    dates = []
+
+    for idx, tx in enumerate(normalized_txs):
+        tx_id = idx + 1
+        category = category_map.get(tx_id, "Other")
+        category_totals[category] += tx["amount"]
+        category_counts[category] += 1
+        if isinstance(tx["date"], str):
+            dates.append(dt.fromisoformat(tx["date"]).date())
+        else:
+            dates.append(tx["date"])
+
+    # Step 8: Build category summaries
+    coverage_from = min(dates).isoformat() if dates else ""
+    coverage_to = max(dates).isoformat() if dates else ""
+    month_year = coverage_to[:7] if coverage_to else ""  # YYYY-MM format
+
+    category_summaries = []
+    for cat, amount in category_totals.items():
+        category_summaries.append({
+            "category": cat,
+            "amount": float(amount),
+            "currency": schema.get("currency", "USD"),
+            "month_year": month_year,
+            "transaction_count": category_counts[cat]
+        })
+
+    # Step 9: Calculate net flow if not provided
+    if net_flow is None:
+        # Calculate from transaction amounts
+        net_flow = sum((tx["amount"] for tx in normalized_txs), Decimal("0"))
+
+    # Step 10: Save statement summary
+    summary_result = await save_statement_summary_handler(
+        category_summaries=category_summaries,
+        bank_name=bank_name or "Unknown",
+        statement_net_flow=float(net_flow),
+        coverage_from=coverage_from,
+        coverage_to=coverage_to,
+        user_id=user_id
+    )
+    structured = summary_result.get("structuredContent", {}) if isinstance(summary_result, dict) else {}
+    if structured.get("error") or structured.get("kind") in {
+        "reconciliation_error",
+        "onboarding_required",
+        "bank_not_registered",
+    }:
+        error_message = structured.get("error") or "Statement summary rejected"
+        logger.error("Statement summary rejected", {"error": error_message})
+        raise ValueError(error_message)
+
+    emit_progress({
+        "type": "stage",
+        "name": "summary_saved",
+    })
+
+    # Step 11: Get dashboard data
+    dashboard_data = get_financial_data_handler(user_id=user_id)
+
+    emit_progress({
+        "type": "stage",
+        "name": "dashboard_ready",
+    })
+
+    return {
+        "status": "success",
+        "transactions_processed": len(normalized_txs),
+        "categories": len(category_summaries),
+        "dashboard": dashboard_data.get("_meta", dashboard_data.get("structuredContent", {})),
+        "message": f"Successfully processed {len(normalized_txs)} transactions across {len(category_summaries)} categories"
+    }
 
 
 @mcp.custom_route("/api/statements/process", methods=["POST"])
@@ -1197,7 +1590,7 @@ async def process_statement_automatically(request: Request):
     Accepts optional header_mapping JSON string from frontend.
     """
     try:
-        user_id = get_or_create_test_user()
+        user_id = await resolve_request_user_id(request, require_auth=True)
         
         # Handle multipart form data
         form = await request.form()
@@ -1242,246 +1635,137 @@ async def process_statement_automatically(request: Request):
             "user_id": user_id,
             "has_header_mapping": bool(header_mapping)
         })
-        
-        # Step 2: Get or create parsing schema
-        schema = None
-        if bank_name:
-            schema = check_existing_parsing_preferences(bank_name, user_id)
-        
-        if not schema:
-            # Check if header mapping was provided from frontend
-            if header_mapping:
-                try:
-                    mapping_data = json.loads(header_mapping)
-                    # Get user currency
-                    from app.database import CategorizationPreference
-                    db = SessionLocal()
-                    try:
-                        settings_pref = db.query(CategorizationPreference).filter(
-                            CategorizationPreference.user_id == user_id,
-                            CategorizationPreference.preference_type == "settings",
-                            CategorizationPreference.name == "user_settings",
-                            CategorizationPreference.enabled.is_(True)
-                        ).first()
-                        currency = "USD"
-                        if settings_pref and settings_pref.rule:
-                            currency = settings_pref.rule.get("functional_currency", "USD")
-                    finally:
-                        db.close()
-                    
-                    # Build schema from user mapping (new structure with column_mappings dict)
-                    column_mappings = mapping_data.get("column_mappings", {})
-                    if not column_mappings:
-                        # Fallback: try to build from old format
-                        description_col = mapping_data.get("description_column", "")
-                        if isinstance(description_col, str):
-                            description_col = [description_col] if description_col else []
-                        elif not isinstance(description_col, list):
-                            description_col = []
-                        column_mappings = {
-                            "date": mapping_data.get("date_column", ""),
-                            "description": description_col,
-                            "amount": mapping_data.get("amount_column", ""),
-                        }
-                        if mapping_data.get("balance_column"):
-                            column_mappings["balance"] = mapping_data["balance_column"]
-                    
-                    schema = {
-                        "column_mappings": column_mappings,
-                        "date_format": mapping_data.get("date_format", "DD/MM/YYYY"),
-                        "currency": currency,
-                        "has_headers": False,  # Always false - we use first_transaction_row instead
-                        "skip_rows": 0,  # Will be calculated from first_transaction_row in parser
-                        "first_transaction_row": mapping_data.get("first_transaction_row", 1),
-                        "amount_positive_is": "debit",
-                    }
-                    
-                    logger.info("Built parsing schema from header mapping", {
-                        "bank_name": bank_name,
-                        "column_mappings": column_mappings,
-                        "column_mappings_types": {k: type(v).__name__ for k, v in column_mappings.items()},
-                        "first_transaction_row": schema["first_transaction_row"]
-                    })
-                    
-                    # Save schema for future use
-                    if bank_name:
-                        save_parsing_schema(schema, bank_name, user_id)
-                except json.JSONDecodeError:
-                    logger.warn("Failed to parse header_mapping, falling back to analysis")
-                    schema = None
-            
-            if not schema:
-                # Auto-analyze structure (use AI to detect format)
-                logger.info("No existing schema, analyzing statement structure")
-                analysis = analyze_statement_structure_from_file(str(file_path), user_id)
-                
-                # Auto-build schema from analysis (use defaults for missing info)
-                schema = build_parsing_schema(analysis, {})
-                
-                # Save schema for future use
-                if bank_name:
-                    save_parsing_schema(schema, bank_name, user_id)
-        
-        # Step 3: Parse transactions
-        transactions = parse_csv_statement(str(file_path), schema)
-        logger.info(f"Parsed {len(transactions)} transactions")
-        
-        if not transactions:
+
+        try:
+            result = await process_statement_pipeline(
+                file_path=file_path,
+                bank_name=bank_name,
+                net_flow=net_flow,
+                header_mapping=header_mapping,
+                user_id=user_id
+            )
+        except ValueError as e:
             return JSONResponse({
-                "error": "No transactions found in statement",
+                "error": str(e),
                 "status": "error"
             }, status_code=400)
+
+        return JSONResponse(result)
         
-        # Step 4: Normalize transactions (extract merchant, etc.)
-        normalized_txs = []
-        for tx in transactions:
-            normalized = normalize_transaction(tx, schema)
-            normalized_txs.append(normalized)
-        
-        # Step 5: Get existing categorization rules
-        from app.database import CategorizationRule
-        db = SessionLocal()
-        try:
-            rules = db.query(CategorizationRule).filter(
-                CategorizationRule.user_id == user_id,
-                CategorizationRule.enabled.is_(True)
-            ).all()
-            existing_rules = [{
-                "merchant_pattern": r.merchant_pattern,
-                "category": r.category
-            } for r in rules]
-        finally:
-            db.close()
-        
-        # Step 6: Categorize transactions using AI (in parallel batches)
-        # Add IDs to transactions for categorization
-        tx_with_ids = [
-            {**tx, "id": idx + 1}
-            for idx, tx in enumerate(normalized_txs)
-        ]
-        
-        logger.info("Starting parallel categorization", {
-            "transaction_count": len(tx_with_ids),
-            "batch_size": 20
-        })
-        
-        categorized = categorize_transactions_batch(
-            tx_with_ids,
-            user_id,
-            existing_rules,
-            batch_size=20,
-            parallel=True
-        )
-        
-        # Create mapping of ID to category
-        category_map = {item["id"]: item["category"] for item in categorized}
-        
-        # Step 6.5: Save individual transactions to database
-        logger.info("Saving individual transactions to database", {
-            "transaction_count": len(normalized_txs),
-            "bank_name": bank_name
-        })
-        
-        db_save = SessionLocal()
-        try:
-            for idx, tx in enumerate(normalized_txs):
-                tx_id = idx + 1
-                category = category_map.get(tx_id, "Other")
-                
-                # Convert date to date object if it's a string
-                tx_date = tx["date"]
-                if isinstance(tx_date, str):
-                    from datetime import datetime as dt
-                    tx_date = dt.fromisoformat(tx_date).date()
-                
-                transaction = Transaction(
-                    user_id=user_id,
-                    date=tx_date,
-                    description=tx["description"],
-                    merchant=tx.get("merchant"),
-                    amount=float(tx["amount"]),
-                    currency=tx.get("currency", schema.get("currency", "USD")),
-                    category=category,
-                    bank_name=bank_name,
-                    profile=None,  # Can be added later if needed
-                )
-                db_save.add(transaction)
-            
-            db_save.commit()
-            logger.info(f"Saved {len(normalized_txs)} transactions to database", {
-                "bank_name": bank_name,
-                "user_id": user_id
-            })
-        except Exception as e:
-            db_save.rollback()
-            logger.error("Failed to save transactions to database", {
-                "error": str(e),
-                "traceback": traceback.format_exc()
-            })
-            raise
-        finally:
-            db_save.close()
-        
-        # Step 7: Aggregate by category
-        from collections import defaultdict
-        from datetime import datetime as dt
-        category_totals = defaultdict(float)
-        category_counts = defaultdict(int)
-        dates = []
-        
-        for idx, tx in enumerate(normalized_txs):
-            tx_id = idx + 1
-            category = category_map.get(tx_id, "Other")
-            category_totals[category] += tx["amount"]
-            category_counts[category] += 1
-            if isinstance(tx["date"], str):
-                dates.append(dt.fromisoformat(tx["date"]).date())
-            else:
-                dates.append(tx["date"])
-        
-        # Step 8: Build category summaries
-        coverage_from = min(dates).isoformat() if dates else ""
-        coverage_to = max(dates).isoformat() if dates else ""
-        month_year = coverage_to[:7] if coverage_to else ""  # YYYY-MM format
-        
-        category_summaries = []
-        for cat, amount in category_totals.items():
-            category_summaries.append({
-                "category": cat,
-                "amount": float(amount),
-                "currency": schema.get("currency", "USD"),
-                "month_year": month_year,
-                "transaction_count": category_counts[cat]
-            })
-        
-        # Step 9: Calculate net flow if not provided
-        if net_flow is None:
-            # Calculate from transaction amounts
-            net_flow = sum(tx["amount"] for tx in normalized_txs)
-        
-        # Step 10: Save statement summary
-        result = await save_statement_summary_handler(
-            category_summaries=category_summaries,
-            bank_name=bank_name or "Unknown",
-            statement_net_flow=float(net_flow),
-            coverage_from=coverage_from,
-            coverage_to=coverage_to,
-            user_id=user_id
-        )
-        
-        # Step 11: Get dashboard data
-        dashboard_data = get_financial_data_handler(user_id=user_id)
-        
-        return JSONResponse({
-            "status": "success",
-            "transactions_processed": len(normalized_txs),
-            "categories": len(category_summaries),
-            "dashboard": dashboard_data.get("_meta", dashboard_data.get("structuredContent", {})),
-            "message": f"Successfully processed {len(normalized_txs)} transactions across {len(category_summaries)} categories"
-        })
-        
+    except HTTPException as e:
+        return JSONResponse({"error": e.detail}, status_code=e.status_code)
     except Exception as e:
         logger.error("Auto-processing error", {
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        })
+        return JSONResponse({
+            "status": "error",
+            "error": str(e)
+        }, status_code=500)
+
+
+@mcp.custom_route("/api/statements/process-stream", methods=["POST"])
+async def process_statement_stream(request: Request):
+    """Stream statement processing progress while categorizing in parallel batches."""
+    try:
+        user_id = await resolve_request_user_id(request, require_auth=True)
+
+        # Handle multipart form data
+        form = await request.form()
+        file = form.get("file")
+        bank_name = form.get("bank_name")
+        net_flow_str = form.get("net_flow")
+        header_mapping = form.get("header_mapping")
+
+        if not file:
+            return JSONResponse({"error": "No file provided"}, status_code=400)
+
+        # Get filename - handle both UploadFile and regular file objects
+        filename = getattr(file, 'filename', None) or 'statement.csv'
+        if hasattr(file, 'file'):
+            file_obj = file.file
+        else:
+            file_obj = file
+
+        net_flow = None
+        if net_flow_str:
+            try:
+                net_flow = float(net_flow_str)
+            except (ValueError, TypeError):
+                pass
+
+        # Step 1: Save file
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        user_upload_dir = UPLOADS_DIR / user_id
+        user_upload_dir.mkdir(exist_ok=True)
+        file_path = user_upload_dir / f"{timestamp}_{filename}"
+
+        with open(file_path, "wb") as buffer:
+            if hasattr(file_obj, 'read'):
+                shutil.copyfileobj(file_obj, buffer)
+            else:
+                # Handle case where file is already bytes
+                buffer.write(file_obj.read() if hasattr(file_obj, 'read') else file_obj)
+
+        logger.info("Auto-processing statement (streaming)", {
+            "filename": filename,
+            "bank_name": bank_name,
+            "user_id": user_id,
+            "has_header_mapping": bool(header_mapping)
+        })
+
+        progress_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
+        progress_queue.put({
+            "type": "stage",
+            "name": "file_saved",
+            "filename": filename,
+        })
+
+        def progress_callback(payload: Dict[str, Any]) -> None:
+            progress_queue.put(payload)
+
+        def worker() -> None:
+            try:
+                result = asyncio.run(process_statement_pipeline(
+                    file_path=file_path,
+                    bank_name=bank_name,
+                    net_flow=net_flow,
+                    header_mapping=header_mapping,
+                    user_id=user_id,
+                    progress_callback=progress_callback
+                ))
+                progress_queue.put({"type": "complete", "result": result})
+            except Exception as e:
+                logger.error("Auto-processing stream error", {
+                    "error": str(e),
+                    "traceback": traceback.format_exc()
+                })
+                progress_queue.put({"type": "error", "error": str(e)})
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        async def event_generator():
+            while True:
+                event = await asyncio.to_thread(progress_queue.get)
+                yield f"data: {json.dumps(event)}\n\n"
+                if event.get("type") in ("complete", "error"):
+                    break
+
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"
+            }
+        )
+
+    except HTTPException as e:
+        return JSONResponse({"error": e.detail}, status_code=e.status_code)
+    except Exception as e:
+        logger.error("Auto-processing stream error", {
             "error": str(e),
             "traceback": traceback.format_exc()
         })
@@ -1495,7 +1779,7 @@ async def process_statement_automatically(request: Request):
 async def get_transactions(request: Request):
     """List transactions with filters"""
     try:
-        user_id = get_or_create_test_user()  # TODO: Get from auth
+        user_id = await resolve_request_user_id(request)
         db = SessionLocal()
         
         query = db.query(Transaction).filter(Transaction.user_id == user_id)
@@ -1541,7 +1825,7 @@ async def get_transactions(request: Request):
 async def update_transaction(request: Request):
     """Update transaction (especially category)"""
     try:
-        user_id = get_or_create_test_user()  # TODO: Get from auth
+        user_id = await resolve_request_user_id(request, require_auth=True)
         data = await request.json()
         transaction_id = data.get("id")
         updates = data.get("updates", {})
@@ -1574,6 +1858,8 @@ async def update_transaction(request: Request):
             "updated": True
         })
         
+    except HTTPException as e:
+        return JSONResponse({"error": e.detail}, status_code=e.status_code)
     except Exception as e:
         logger.error("Update transaction error", {"error": str(e)})
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -1583,7 +1869,7 @@ async def update_transaction(request: Request):
 async def get_financial_data_api(request: Request):
     """REST version of get_financial_data MCP tool"""
     try:
-        user_id = get_or_create_test_user()  # TODO: Get from auth
+        user_id = await resolve_request_user_id(request)
         
         # Get filters from query params
         bank_name = request.query_params.get("bank_name")
@@ -1612,7 +1898,7 @@ async def get_financial_data_api(request: Request):
 async def manage_budgets(request: Request):
     """Get or save budgets"""
     try:
-        user_id = get_or_create_test_user()  # TODO: Get from auth
+        user_id = await resolve_request_user_id(request, require_auth=request.method != "GET")
         
         if request.method == "GET":
             # Return existing budgets
@@ -1635,6 +1921,8 @@ async def manage_budgets(request: Request):
             result = await save_budget_handler(budgets=budgets, user_id=user_id)
             return JSONResponse(result.get("structuredContent", {"status": "saved"}))
             
+    except HTTPException as e:
+        return JSONResponse({"error": e.detail}, status_code=e.status_code)
     except Exception as e:
         logger.error("Manage budgets error", {"error": str(e)})
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -1644,7 +1932,7 @@ async def manage_budgets(request: Request):
 async def manage_preferences_api(request: Request):
     """Get or save preferences (categorization or parsing)"""
     try:
-        user_id = get_or_create_test_user()  # TODO: Get from auth
+        user_id = await resolve_request_user_id(request, require_auth=request.method != "GET")
         
         if request.method == "GET":
             preference_type = request.query_params.get("preference_type", "categorization")
@@ -1671,8 +1959,60 @@ async def manage_preferences_api(request: Request):
             
             return JSONResponse(result.get("structuredContent", {"status": "saved"}))
         
+    except HTTPException as e:
+        return JSONResponse({"error": e.detail}, status_code=e.status_code)
     except Exception as e:
         logger.error("Preferences API error", {"error": str(e)})
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/preferences/{preference_id}", methods=["DELETE"])
+async def delete_preference_api(request: Request, preference_id: str):
+    """Disable a preference by ID."""
+    try:
+        user_id = await resolve_request_user_id(request, require_auth=True)
+        db = SessionLocal()
+        try:
+            pref = db.query(CategorizationPreference).filter(
+                CategorizationPreference.id == preference_id,
+                CategorizationPreference.user_id == user_id,
+            ).first()
+            if not pref:
+                return JSONResponse({"error": "Preference not found"}, status_code=404)
+            pref.enabled = False
+            pref.updated_at = datetime.now()
+            db.commit()
+            return JSONResponse({"id": str(pref.id), "status": "disabled"})
+        finally:
+            db.close()
+    except HTTPException as e:
+        return JSONResponse({"error": e.detail}, status_code=e.status_code)
+    except Exception as e:
+        logger.error("Delete preference error", {"error": str(e)})
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/mutate-categories", methods=["POST"])
+async def mutate_categories_api(request: Request):
+    """REST endpoint for mutate_categories."""
+    try:
+        user_id = await resolve_request_user_id(request, require_auth=True)
+        data = await request.json()
+        operations = data.get("operations", [])
+        bank_name = data.get("bank_name")
+        month_year = data.get("month_year")
+
+        result = mutate_categories_handler(
+            operations=operations,
+            user_id=user_id,
+            bank_name=bank_name,
+            month_year=month_year,
+        )
+        return JSONResponse(result)
+    except HTTPException as e:
+        return JSONResponse({"error": e.detail}, status_code=e.status_code)
+    except Exception as e:
+        logger.error("Mutate categories error", {"error": str(e)})
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
@@ -1680,7 +2020,7 @@ async def manage_preferences_api(request: Request):
 async def manage_banks_api(request: Request):
     """Get or add banks for user"""
     try:
-        user_id = get_or_create_test_user()  # TODO: Get from auth
+        user_id = await resolve_request_user_id(request, require_auth=request.method != "GET")
         
         if request.method == "GET":
             # Get registered banks from user settings
@@ -1746,6 +2086,8 @@ async def manage_banks_api(request: Request):
             finally:
                 db.close()
         
+    except HTTPException as e:
+        return JSONResponse({"error": e.detail}, status_code=e.status_code)
     except Exception as e:
         logger.error("Banks API error", {"error": str(e)})
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -1758,10 +2100,12 @@ async def register(request: Request):
         data = await request.json()
         email = data.get("email")
         name = data.get("name")
-        password = data.get("password")  # TODO: Hash password properly
+        password = data.get("password")
         
         if not email:
             return JSONResponse({"error": "Email is required"}, status_code=400)
+        if not password:
+            return JSONResponse({"error": "Password is required"}, status_code=400)
         
         db = SessionLocal()
         try:
@@ -1771,7 +2115,11 @@ async def register(request: Request):
                 return JSONResponse({"error": "User already exists"}, status_code=400)
             
             # Create new user
-            user = User(email=email, name=name or email.split("@")[0])
+            user = User(
+                email=email,
+                name=name or email.split("@")[0],
+                password_hash=hash_password(password),
+            )
             db.add(user)
             db.commit()
             db.refresh(user)
@@ -1805,19 +2153,20 @@ async def login(request: Request):
     try:
         data = await request.json()
         email = data.get("email")
-        password = data.get("password")  # TODO: Verify password properly
+        password = data.get("password")
         
         if not email:
             return JSONResponse({"error": "Email is required"}, status_code=400)
+        if not password:
+            return JSONResponse({"error": "Password is required"}, status_code=400)
         
         db = SessionLocal()
         try:
             user = db.query(User).filter(User.email == email).first()
             if not user:
                 return JSONResponse({"error": "Invalid credentials"}, status_code=401)
-            
-            # TODO: Verify password hash
-            # For now, allow login without password verification (development only)
+            if not user.password_hash or not verify_password(password, user.password_hash):
+                return JSONResponse({"error": "Invalid credentials"}, status_code=401)
             
             # Generate JWT token
             token = jwt.encode(

@@ -5,7 +5,10 @@
  */
 import type { DashboardProps } from '../shared/schemas';
 
-const API_BASE_URL = process.env.API_BASE_URL || 'http://localhost:8000';
+const API_BASE_URL =
+  import.meta.env.VITE_API_BASE_URL ||
+  import.meta.env.VITE_API_URL ||
+  'http://localhost:8000';
 
 export interface Transaction {
   id: string;
@@ -34,9 +37,27 @@ export interface Budget {
 }
 
 export interface Preferences {
+  preferences?: any[];
+  settings?: any;
+  summary?: any;
   categorization?: any[];
   parsing?: any[];
 }
+
+export type CategoryMutationOperation =
+  | {
+      type: 'edit';
+      category: string;
+      new_amount: number;
+      note?: string;
+    }
+  | {
+      type: 'transfer';
+      from_category: string;
+      to_category: string;
+      transfer_amount: number;
+      note?: string;
+    };
 
 class ApiClient {
   private baseUrl: string;
@@ -266,10 +287,16 @@ class ApiClient {
   }
 
   // Preferences
-  async getPreferences(preferenceType?: 'categorization' | 'parsing' | 'settings'): Promise<Preferences> {
+  async getPreferences(
+    preferenceType?: 'categorization' | 'parsing' | 'settings' | 'list',
+    bankName?: string
+  ): Promise<Preferences> {
     const params = new URLSearchParams();
     if (preferenceType) {
       params.append('preference_type', preferenceType);
+    }
+    if (bankName) {
+      params.append('bank_name', bankName);
     }
     const query = params.toString();
     return this.request<Preferences>(
@@ -284,6 +311,23 @@ class ApiClient {
     await this.request('/api/preferences', {
       method: 'POST',
       body: JSON.stringify({ preferences, preference_type: preferenceType }),
+    });
+  }
+
+  async deletePreference(preferenceId: string): Promise<void> {
+    await this.request(`/api/preferences/${preferenceId}`, {
+      method: 'DELETE',
+    });
+  }
+
+  async mutateCategories(input: {
+    operations: CategoryMutationOperation[];
+    bank_name?: string;
+    month_year?: string;
+  }): Promise<{ updated_categories: Record<string, number>; change_summary: any[]; status: string }> {
+    return this.request('/api/mutate-categories', {
+      method: 'POST',
+      body: JSON.stringify(input),
     });
   }
 
@@ -448,6 +492,91 @@ class ApiClient {
     }
 
     return response.json();
+  }
+
+  async processStatementStream(
+    file: File,
+    bankName: string,
+    netFlow: number | undefined,
+    headerMapping: {
+      column_mappings: any;
+      has_headers?: boolean;
+      first_transaction_row?: number;
+      date_format?: string;
+      currency?: string;
+    } | undefined,
+    onEvent?: (event: any) => void
+  ): Promise<{
+    status: string;
+    transactions_processed?: number;
+    categories?: number;
+    dashboard?: any;
+    message?: string;
+  }> {
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('bank_name', bankName);
+    if (netFlow !== undefined) {
+      formData.append('net_flow', netFlow.toString());
+    }
+    if (headerMapping) {
+      formData.append('header_mapping', JSON.stringify(headerMapping));
+    }
+
+    const response = await fetch(`${this.baseUrl}/api/statements/process-stream`, {
+      method: 'POST',
+      body: formData,
+      headers: {
+        Accept: 'text/event-stream',
+        ...(this.authToken ? { Authorization: `Bearer ${this.authToken}` } : {}),
+      },
+    });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({ error: response.statusText }));
+      throw new Error(error.error || `Failed to process statement: ${response.statusText}`);
+    }
+
+    const reader = response.body?.getReader();
+    const decoder = new TextDecoder();
+
+    if (!reader) {
+      throw new Error('Response body is not readable');
+    }
+
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.startsWith('data:')) continue;
+
+        const payload = trimmed.slice(5).trim();
+        if (!payload) continue;
+
+        try {
+          const event = JSON.parse(payload);
+          if (event.type === 'complete') {
+            return event.result;
+          }
+          if (event.type === 'error') {
+            throw new Error(event.error || 'Processing failed');
+          }
+          if (onEvent) onEvent(event);
+        } catch (e) {
+          // Ignore malformed JSON fragments
+        }
+      }
+    }
+
+    throw new Error('Processing stream ended without completion');
   }
 }
 

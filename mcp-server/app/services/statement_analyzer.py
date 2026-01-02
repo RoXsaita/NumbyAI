@@ -102,7 +102,7 @@ def analyze_statement_structure_from_file(file_path: str, user_id: str) -> Dict:
         # Read first 30 rows for analysis (as strings to preserve formatting)
         df = pd.read_csv(file_path, nrows=30, dtype=str, keep_default_na=False)
         
-        columns_found = [f"Column {i}" for i in range(len(df.columns))]
+        columns_found = [str(i) for i in range(len(df.columns))]
         
         # Detect date column and format
         date_column = None
@@ -133,7 +133,7 @@ def analyze_statement_structure_from_file(file_path: str, user_id: str) -> Dict:
             
             # If at least 60% match, consider it a date column
             if best_matches >= len(col_data.head(20)) * 0.6:
-                date_column = f"Column {col_idx}"
+                date_column = str(col_idx)
                 date_format = best_format
                 break
         
@@ -157,7 +157,7 @@ def analyze_statement_structure_from_file(file_path: str, user_id: str) -> Dict:
             
             # If most values are numeric, likely an amount column
             if numeric_count >= len(col_data.head(20)) * 0.7:
-                amount_column = f"Column {col_idx}"
+                amount_column = str(col_idx)
                 break
         
         # Detect description column (longest text column, typically not date/amount)
@@ -178,7 +178,7 @@ def analyze_statement_structure_from_file(file_path: str, user_id: str) -> Dict:
             
             if avg_length > max_avg_length and avg_length > 10:  # At least 10 chars average
                 max_avg_length = avg_length
-                description_column = f"Column {col_idx}"
+                description_column = str(col_idx)
         
         # Detect balance column (numeric, typically after amount column)
         balance_column = None
@@ -196,7 +196,7 @@ def analyze_statement_structure_from_file(file_path: str, user_id: str) -> Dict:
                                    if re.match(r'^-?\d+[.,]?\d*$', re.sub(r'[$€£¥,\s()]', '', str(val))))
                 
                 if numeric_count >= len(col_data.head(20)) * 0.7:
-                    balance_column = f"Column {col_idx}"
+                    balance_column = str(col_idx)
                     break
         
         # Detect currency (look for currency symbols or codes in amount column)
@@ -238,9 +238,9 @@ def analyze_statement_structure_from_file(file_path: str, user_id: str) -> Dict:
         
         analysis = {
             "columns_found": columns_found,
-            "date_column": date_column or "Column 0",
-            "description_column": description_column or "Column 1",
-            "amount_column": amount_column or "Column 2",
+            "date_column": date_column or "0",
+            "description_column": description_column or "1",
+            "amount_column": amount_column or "2",
             "balance_column": balance_column,
             "date_format": date_format or "DD/MM/YYYY",
             "currency": currency,

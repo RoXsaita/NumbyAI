@@ -11,7 +11,10 @@
  * 7. Dashboard
  */
 import React, { useState, useEffect, useRef } from 'react';
+import { Link } from 'react-router-dom';
 import { apiClient } from '../lib/api-client';
+import { config } from '../config';
+import type { DashboardProps } from '../shared/schemas';
 import { DashboardWidget } from '../widgets/dashboard';
 
 type UploadStep =
@@ -55,6 +58,7 @@ export const SimpleUpload: React.FC = () => {
   const [bankName, setBankName] = useState<string>('');
   const [newBankName, setNewBankName] = useState<string>('');
   const [showNewBankInput, setShowNewBankInput] = useState(false);
+  const [isLoadingBankPrefs, setIsLoadingBankPrefs] = useState(false);
   // Column mappings: maps column index to field type
   const [columnMappings, setColumnMappings] = useState<{
     [columnIndex: number]: string;  // Maps column index to field type
@@ -68,33 +72,13 @@ export const SimpleUpload: React.FC = () => {
     label: string;
     status: 'pending' | 'active' | 'done';
   }>>([]);
-  const processingTimers = useRef<number[]>([]);
-  const processingInterval = useRef<number | null>(null);
+  const lastBankPrefsKey = useRef<string>('');
+  const [dashboardOverride, setDashboardOverride] = useState<DashboardProps | null>(null);
 
   // Load user settings on mount
   useEffect(() => {
     loadUserSettings();
   }, []);
-
-  useEffect(() => {
-    return () => {
-      processingTimers.current.forEach((timerId) => window.clearTimeout(timerId));
-      processingTimers.current = [];
-      if (processingInterval.current !== null) {
-        window.clearInterval(processingInterval.current);
-        processingInterval.current = null;
-      }
-    };
-  }, []);
-
-  const clearProcessingTimers = () => {
-    processingTimers.current.forEach((timerId) => window.clearTimeout(timerId));
-    processingTimers.current = [];
-    if (processingInterval.current !== null) {
-      window.clearInterval(processingInterval.current);
-      processingInterval.current = null;
-    }
-  };
 
   const updateProcessingStep = (
     index: number,
@@ -114,80 +98,71 @@ export const SimpleUpload: React.FC = () => {
     });
   };
 
-  const estimateBatchCount = () => {
-    const estimatedTransactions = uploadResult?.transactions_count
-      ?? (uploadResult?.total_rows
-        ? Math.max(0, uploadResult.total_rows - (firstTransactionRow || 1) + 1)
-        : 0);
-    return Math.max(1, Math.ceil((estimatedTransactions || 1) / 20));
-  };
-
-  const startProcessingProgress = (totalBatches: number) => {
-    clearProcessingTimers();
-    const batches = Math.max(1, totalBatches);
-    const minTotalMs = 12000;
-    const maxTotalMs = 45000;
-    const targetTotalMs = Math.min(maxTotalMs, Math.max(minTotalMs, batches * 1200));
-    const perBatchMs = Math.max(800, Math.round(targetTotalMs / batches));
+  const initializeProcessingProgress = () => {
     const steps = [
       { label: 'Validating file', status: 'active' as const },
       { label: 'Parsing transactions', status: 'pending' as const },
-      { label: 'Normalizing data', status: 'pending' as const },
-      { label: `Categorizing batch 1/${batches}`, status: 'pending' as const },
+      { label: 'Categorizing batches', status: 'pending' as const },
       { label: 'Saving transactions', status: 'pending' as const },
       { label: 'Building dashboard', status: 'pending' as const },
     ];
     setProcessingSteps(steps);
     setProcessingProgress('Validating file...');
+  };
 
-    const schedule = (delayMs: number, callback: () => void) => {
-      const timerId = window.setTimeout(callback, delayMs);
-      processingTimers.current.push(timerId);
-    };
+  const handleProcessingEvent = (event: any) => {
+    if (!event) return;
 
-    schedule(800, () => {
-      updateProcessingStep(0, 'done');
-      updateProcessingStep(1, 'active');
-      setProcessingProgress('Parsing transactions...');
-    });
-
-    schedule(2000, () => {
-      updateProcessingStep(1, 'done');
-      updateProcessingStep(2, 'active');
-      setProcessingProgress('Normalizing data...');
-    });
-
-    schedule(3200, () => {
-      updateProcessingStep(2, 'done');
-      updateProcessingStep(3, 'active');
-      let currentBatch = 1;
-      updateProcessingStep(3, 'active', `Categorizing batch ${currentBatch}/${batches}`);
-      setProcessingProgress(`Categorizing batch ${currentBatch}/${batches}...`);
-
-      processingInterval.current = window.setInterval(() => {
-        currentBatch += 1;
-        if (currentBatch <= batches) {
-          updateProcessingStep(3, 'active', `Categorizing batch ${currentBatch}/${batches}`);
-          setProcessingProgress(`Categorizing batch ${currentBatch}/${batches}...`);
-          return;
-        }
-
-        if (processingInterval.current !== null) {
-          window.clearInterval(processingInterval.current);
-          processingInterval.current = null;
-        }
-
+    if (event.type === 'stage') {
+      if (event.name === 'file_saved') {
+        updateProcessingStep(0, 'done');
+        updateProcessingStep(1, 'active');
+        setProcessingProgress('Parsing transactions...');
+      } else if (event.name === 'parsed') {
+        updateProcessingStep(1, 'done');
+        updateProcessingStep(2, 'active');
+        setProcessingProgress('Categorizing transactions...');
+      } else if (event.name === 'transactions_saved') {
         updateProcessingStep(3, 'done');
         updateProcessingStep(4, 'active');
-        setProcessingProgress('Saving transactions...');
+        setProcessingProgress('Building dashboard...');
+      } else if (event.name === 'dashboard_ready') {
+        updateProcessingStep(4, 'done');
+        setProcessingProgress('Complete!');
+      }
+      return;
+    }
 
-        schedule(1400, () => {
-          updateProcessingStep(4, 'done');
-          updateProcessingStep(5, 'active');
-          setProcessingProgress('Building dashboard...');
-        });
-      }, perBatchMs);
-    });
+    if (event.type === 'categorization_start') {
+      const total = event.total_batches || 0;
+      const label = total > 0
+        ? `Categorizing batches 0/${total}${event.parallel ? ' (parallel)' : ''}`
+        : 'Categorizing batches';
+      updateProcessingStep(2, 'active', label);
+      setProcessingProgress('Categorizing transactions...');
+      return;
+    }
+
+    if (event.type === 'categorization_progress') {
+      const total = event.total_batches || 0;
+      const completed = event.completed_batches || 0;
+      const label = total > 0
+        ? `Categorizing batches ${completed}/${total}`
+        : `Categorizing batches ${completed}`;
+      updateProcessingStep(2, 'active', label);
+      setProcessingProgress(`${label}...`);
+      return;
+    }
+
+    if (event.type === 'categorization_complete') {
+      const total = event.total_batches || 0;
+      const label = total > 0
+        ? `Categorizing batches ${total}/${total}`
+        : 'Categorizing batches complete';
+      updateProcessingStep(2, 'done', label);
+      updateProcessingStep(3, 'active');
+      setProcessingProgress('Saving transactions...');
+    }
   };
 
   const loadUserSettings = async () => {
@@ -202,6 +177,64 @@ export const SimpleUpload: React.FC = () => {
     }
   };
 
+  const loadBankParsingPreferences = async (selectedBank: string) => {
+    if (!selectedBank || !uploadResult) return;
+    setIsLoadingBankPrefs(true);
+    try {
+      const prefsResponse = await apiClient.getPreferences('parsing', selectedBank);
+      const preferences = (prefsResponse as any)?.preferences || [];
+      const latestSchema = preferences[0]?.instructions ?? preferences[0]?.rule ?? null;
+
+      setUploadResult((prev: any) => prev ? ({
+        ...prev,
+        parsing_preferences_exist: Boolean(latestSchema),
+        saved_mappings: latestSchema,
+      }) : prev);
+    } catch (err) {
+      console.error('Failed to load parsing preferences:', err);
+      setUploadResult((prev: any) => prev ? ({
+        ...prev,
+        parsing_preferences_exist: false,
+        saved_mappings: null,
+      }) : prev);
+    } finally {
+      setIsLoadingBankPrefs(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!uploadResult) return;
+
+    const jobId = uploadResult?.job_id || '';
+    const key = bankName ? `${bankName}:${jobId}` : '';
+
+    if (!bankName) {
+      if (lastBankPrefsKey.current) {
+        lastBankPrefsKey.current = '';
+        setUploadResult((prev: any) => prev ? ({
+          ...prev,
+          parsing_preferences_exist: false,
+          saved_mappings: null,
+        }) : prev);
+      }
+      return;
+    }
+
+    if (lastBankPrefsKey.current === key) return;
+    if (uploadResult?.saved_mappings && !lastBankPrefsKey.current) {
+      lastBankPrefsKey.current = key;
+      return;
+    }
+
+    lastBankPrefsKey.current = key;
+    setUploadResult((prev: any) => prev ? ({
+      ...prev,
+      parsing_preferences_exist: false,
+      saved_mappings: null,
+    }) : prev);
+    void loadBankParsingPreferences(bankName);
+  }, [bankName, uploadResult?.job_id]);
+
   const handleFileSelect = async (selectedFile: File) => {
     if (!selectedFile) return;
 
@@ -215,7 +248,7 @@ export const SimpleUpload: React.FC = () => {
       setTimeout(() => setUploadProgress('Analyzing file structure...'), 500);
 
       // Upload file and get analysis
-      const result = await apiClient.uploadStatement(selectedFile);
+      const result = await apiClient.uploadStatement(selectedFile, undefined, bankName || undefined);
 
       setTimeout(() => setUploadProgress('Detecting columns and format...'), 1000);
       setTimeout(() => {
@@ -496,7 +529,9 @@ export const SimpleUpload: React.FC = () => {
       );
     }
 
-    console.log('[DEBUG] Column mappings validated successfully:', result.column_mappings);
+    if (config.debug) {
+      console.log('[DEBUG] Column mappings validated successfully:', result.column_mappings);
+    }
     return result;
   };
 
@@ -506,8 +541,10 @@ export const SimpleUpload: React.FC = () => {
     const amountMapped = Object.values(columnMappings).includes('amount');
     const descriptionMapped = Object.values(columnMappings).filter(v => v === 'description').length > 0;
 
-    console.log('[DEBUG] handleHeaderMappingSave - columnMappings state:', columnMappings);
-    console.log('[DEBUG] Required fields check:', { dateMapped, amountMapped, descriptionMapped });
+    if (config.debug) {
+      console.log('[DEBUG] handleHeaderMappingSave - columnMappings state:', columnMappings);
+      console.log('[DEBUG] Required fields check:', { dateMapped, amountMapped, descriptionMapped });
+    }
 
     if (!dateMapped || !amountMapped || !descriptionMapped) {
       setError('Please map all required columns: Date, Amount, and at least one Description column');
@@ -526,7 +563,9 @@ export const SimpleUpload: React.FC = () => {
 
     try {
       const mappingData = convertMappingsToAPI();
-      console.log('[DEBUG] Converted mapping data to send to API:', mappingData);
+      if (config.debug) {
+        console.log('[DEBUG] Converted mapping data to send to API:', mappingData);
+      }
       await apiClient.saveHeaderMapping(bankName, mappingData);
       // Go directly to processing after saving mapping
       await handleProcess();
@@ -544,23 +583,23 @@ export const SimpleUpload: React.FC = () => {
 
     setStep('processing');
     setError(null);
-    startProcessingProgress(estimateBatchCount());
+    initializeProcessingProgress();
 
     try {
       const netFlowValue = netFlow ? parseFloat(netFlow) : undefined;
       // Include mappings if it's a new bank
       const mapping = uploadResult?.parsing_preferences_exist ? undefined : convertMappingsToAPI();
 
-      setProcessingProgress('Parsing transactions...');
-      const result = await apiClient.processStatement(
+      const result = await apiClient.processStatementStream(
         file,
         bankName,
         netFlowValue,
-        mapping
+        mapping,
+        handleProcessingEvent
       );
 
       if (result.status === 'success') {
-        clearProcessingTimers();
+        setDashboardOverride((result as any).dashboard || null);
         setProcessingSteps((prev) => prev.map((step) => ({ ...step, status: 'done' })));
         setProcessingProgress('Complete!');
         setStep('success');
@@ -568,7 +607,6 @@ export const SimpleUpload: React.FC = () => {
         throw new Error((result as any).error || 'Processing failed');
       }
     } catch (err) {
-      clearProcessingTimers();
       setError(err instanceof Error ? err.message : 'Failed to process statement');
       setProcessingProgress('Processing failed.');
       setProcessingSteps([]);
@@ -582,7 +620,6 @@ export const SimpleUpload: React.FC = () => {
   };
 
   const reset = () => {
-    clearProcessingTimers();
     setStep('file_upload');
     setFile(null);
     setUploadResult(null);
@@ -596,7 +633,11 @@ export const SimpleUpload: React.FC = () => {
     setError(null);
     setProcessingProgress('');
     setProcessingSteps([]);
+    setDashboardOverride(null);
   };
+
+  const hasSavedMappings = Boolean(uploadResult?.saved_mappings);
+  const hasParsingPreferences = Boolean(uploadResult?.parsing_preferences_exist);
 
   // Success view
   if (step === 'success') {
@@ -622,7 +663,7 @@ export const SimpleUpload: React.FC = () => {
             Your Financial Dashboard
           </h2>
         </div>
-        <DashboardWidget />
+        <DashboardWidget initialData={dashboardOverride} />
       </div>
     );
   }
@@ -776,6 +817,22 @@ export const SimpleUpload: React.FC = () => {
           maxWidth: '1400px',
           width: '100%',
         }}>
+          <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '12px' }}>
+            <Link
+              to="/dashboard"
+              style={{
+                padding: '8px 12px',
+                backgroundColor: '#111827',
+                color: 'white',
+                borderRadius: '8px',
+                textDecoration: 'none',
+                fontSize: '13px',
+                fontWeight: 600,
+              }}
+            >
+              View Dashboard
+            </Link>
+          </div>
           {/* Progress indicator */}
           <div style={{ marginBottom: '32px' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
@@ -1045,23 +1102,25 @@ export const SimpleUpload: React.FC = () => {
               {/* Continue Button */}
               <button
                 onClick={handleMainScreenContinue}
-                disabled={isUploading || (!file && !uploadResult) || (!bankName && !showNewBankInput)}
+                disabled={isUploading || isLoadingBankPrefs || (!file && !uploadResult) || (!bankName && !showNewBankInput)}
                 style={{
                   width: '100%',
                   padding: '14px',
-                  backgroundColor: (!isUploading && (file || uploadResult) && (bankName || showNewBankInput)) ? '#dc2626' : '#9ca3af',
+                  backgroundColor: (!isUploading && !isLoadingBankPrefs && (file || uploadResult) && (bankName || showNewBankInput)) ? '#dc2626' : '#9ca3af',
                   color: 'white',
                   border: 'none',
                   borderRadius: '8px',
                   fontSize: '16px',
                   fontWeight: 600,
-                  cursor: (!isUploading && (file || uploadResult) && (bankName || showNewBankInput)) ? 'pointer' : 'not-allowed',
+                  cursor: (!isUploading && !isLoadingBankPrefs && (file || uploadResult) && (bankName || showNewBankInput)) ? 'pointer' : 'not-allowed',
                 }}
               >
                 {isUploading ? 'Uploading...' :
-                  !file && !uploadResult ? 'Upload a file first' :
-                    uploadResult?.parsing_preferences_exist ? 'Process Statement' :
-                      'Continue to Mapping'}
+                  isLoadingBankPrefs ? 'Loading saved settings...' :
+                    !file && !uploadResult ? 'Upload a file first' :
+                      hasSavedMappings ? 'Review Mapping' :
+                        hasParsingPreferences ? 'Process Statement' :
+                          'Continue to Mapping'}
               </button>
             </div>
           )}

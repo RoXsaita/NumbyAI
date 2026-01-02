@@ -1,0 +1,1 @@
+ONE category per transaction. Refunds -> original category. Own-account transfers -> Internal Transfers.

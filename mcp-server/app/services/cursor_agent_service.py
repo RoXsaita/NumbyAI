@@ -11,10 +11,12 @@ import subprocess
 import json
 import os
 import asyncio
-from typing import Dict, List, Optional, Union, Iterator, AsyncIterator
+from typing import Dict, List, Optional, Union, Iterator, AsyncIterator, Callable, Any, Tuple
 from app.config import settings
 from app.logger import create_logger
-from app.tools.category_helpers import PREDEFINED_CATEGORIES
+from app.tools.category_helpers import PREDEFINED_CATEGORIES, normalize_category
+from app.prompts import load_prompt, render_prompt
+from app.services.categorization_rules import CategorizationRule, format_rules_for_prompt
 
 logger = create_logger("cursor_agent_service")
 
@@ -114,42 +116,10 @@ def analyze_statement_structure(csv_sample: str, user_id: str) -> Dict:
     Returns:
         Dict with analysis and questions for user
     """
-    prompt = f"""Analyze this bank statement CSV and identify its structure.
-
-CSV Sample (first 50 rows):
-{csv_sample}
-
-Please analyze:
-1. What columns exist? (date, description, amount, balance, etc.)
-2. Which column contains the transaction date?
-3. Which column contains the transaction description?
-4. Which column contains the transaction amount?
-5. What date format is used? (MM/DD/YYYY, DD/MM/YYYY, YYYY-MM-DD, etc.)
-6. What currency is used?
-7. Are there headers in the first row?
-8. Are there any rows to skip at the beginning?
-
-Return your analysis as JSON with this structure:
-{{
-    "columns_found": ["list of column names or indices"],
-    "date_column": "Column A" or column name,
-    "description_column": "Column B" or column name,
-    "amount_column": "Column C" or column name,
-    "balance_column": "Column D" or column name (if exists),
-    "date_format": "MM/DD/YYYY" or detected format,
-    "currency": "USD" or detected currency,
-    "has_headers": true/false,
-    "skip_rows": 0 or number of rows to skip,
-    "amount_positive_is": "debit" or "credit",
-    "questions": [
-        "Question 1 for user",
-        "Question 2 for user"
-    ],
-    "confidence": "high" or "medium" or "low"
-}}
-
-If you're uncertain about any field, include it in the questions array for the user to confirm.
-"""
+    prompt = render_prompt(
+        load_prompt("analyze_statement_structure.txt"),
+        csv_sample=csv_sample,
+    )
     
     try:
         response = call_cursor_agent(prompt, model="auto")
@@ -187,12 +157,71 @@ If you're uncertain about any field, include it in the questions array for the u
         raise
 
 
+def _build_categorization_prompt(
+    transactions: List[Dict],
+    rules: List[CategorizationRule],
+    prompt_name: str,
+    extra_instructions: str = "",
+) -> str:
+    categories_str = ", ".join(PREDEFINED_CATEGORIES)
+    rules_str = format_rules_for_prompt(rules)
+    transactions_json = json.dumps(transactions, indent=2, default=str)
+    template = load_prompt(prompt_name)
+    return render_prompt(
+        template,
+        categories=categories_str,
+        rules=rules_str,
+        transactions=transactions_json,
+        extra_instructions=extra_instructions,
+    )
+
+
+def _validate_categorization_results(
+    transactions: List[Dict],
+    categorized: List[Dict],
+) -> Tuple[List[Dict[str, Any]], List[int], List[str]]:
+    expected_ids = {tx.get("id") for tx in transactions}
+    expected_ids.discard(None)
+    seen_ids = set()
+    normalized: List[Dict[str, Any]] = []
+    errors: List[str] = []
+
+    for item in categorized:
+        if not isinstance(item, dict):
+            errors.append("Invalid item type")
+            continue
+        item_id = item.get("id")
+        try:
+            item_id = int(item_id)
+        except (TypeError, ValueError):
+            errors.append(f"Invalid id: {item.get('id')}")
+            continue
+        if item_id not in expected_ids:
+            errors.append(f"Unexpected id: {item_id}")
+            continue
+        if item_id in seen_ids:
+            errors.append(f"Duplicate id: {item_id}")
+            continue
+        category = normalize_category(str(item.get("category") or ""))
+        if not category:
+            errors.append(f"Invalid category for id {item_id}: {item.get('category')}")
+            continue
+        seen_ids.add(item_id)
+        normalized.append({"id": item_id, "category": category})
+
+    missing_ids = sorted(expected_ids - seen_ids)
+    return normalized, missing_ids, errors
+
+
 def categorize_transactions_batch(
     transactions: List[Dict],
     user_id: str,
-    existing_rules: List[Dict],
+    rules: List[CategorizationRule],
     batch_size: int = 20,
-    parallel: bool = True
+    parallel: bool = True,
+    max_workers: Optional[int] = None,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    prompt_variant: str = "default",
 ) -> List[Dict]:
     """
     Categorize a batch of transactions using Cursor Agent.
@@ -216,29 +245,87 @@ def categorize_transactions_batch(
     for i in range(0, len(transactions), batch_size):
         batches.append(transactions[i:i + batch_size])
     
+    def emit_progress(payload: Dict[str, Any]) -> None:
+        if not progress_callback:
+            return
+        try:
+            progress_callback(payload)
+        except Exception as e:
+            logger.warn("Progress callback failed", {"error": str(e)})
+
+    worker_limit = max_workers if max_workers is not None else settings.categorization_max_workers
+    worker_limit = max(1, worker_limit)
+    worker_count = min(len(batches), worker_limit)
+
     logger.info("Categorizing transactions", {
         "total": len(transactions),
         "batches": len(batches),
         "batch_size": batch_size,
-        "parallel": parallel
+        "parallel": parallel,
+        "max_workers": worker_count
+    })
+
+    emit_progress({
+        "type": "categorization_start",
+        "total_transactions": len(transactions),
+        "total_batches": len(batches),
+        "batch_size": batch_size,
+        "parallel": parallel and len(batches) > 1,
+        "max_workers": worker_count,
     })
     
+    def categorize_single_batch(batch: List[Dict]) -> List[Dict]:
+        """Categorize a single batch of transactions with validation retries."""
+        max_attempts = 2
+        attempt = 0
+        last_normalized: List[Dict[str, Any]] = []
+        missing_ids: List[int] = []
+        errors: List[str] = []
+        extra_instructions = ""
+
+        while attempt < max_attempts:
+            result = _categorize_batch_internal(
+                batch,
+                user_id,
+                rules,
+                prompt_variant,
+                extra_instructions=extra_instructions,
+            )
+            normalized, missing_ids, errors = _validate_categorization_results(batch, result)
+            if not errors and not missing_ids:
+                return normalized
+            attempt += 1
+            last_normalized = normalized
+            missing_text = ", ".join(str(mid) for mid in missing_ids)
+            error_text = "; ".join(errors[:5])
+            extra_instructions = (
+                f"\nPrevious output had issues: {error_text}."
+                f" Return categories for ALL transaction ids. Missing ids: {missing_text}."
+            )
+
+        if missing_ids:
+            logger.warn("Categorization output incomplete after retries", {
+                "missing_ids": missing_ids,
+                "errors": errors,
+            })
+            for missing_id in missing_ids:
+                last_normalized.append({"id": missing_id, "category": "Other"})
+
+        return last_normalized
+
     if parallel and len(batches) > 1:
         # Process batches in parallel using ThreadPoolExecutor
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        
-        def categorize_single_batch(batch: List[Dict]) -> List[Dict]:
-            """Categorize a single batch of transactions"""
-            return _categorize_batch_internal(batch, user_id, existing_rules)
-        
+
         all_results = []
-        with ThreadPoolExecutor(max_workers=min(len(batches), 5)) as executor:
+        completed_batches = 0
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
             # Submit all batches
             future_to_batch = {
                 executor.submit(categorize_single_batch, batch): idx
                 for idx, batch in enumerate(batches)
             }
-            
+
             # Collect results as they complete
             batch_results = [None] * len(batches)
             for future in as_completed(future_to_batch):
@@ -246,15 +333,31 @@ def categorize_transactions_batch(
                 try:
                     result = future.result()
                     batch_results[batch_idx] = result
+                    completed_batches += 1
                     logger.info(f"Completed batch {batch_idx + 1}/{len(batches)}", {
                         "batch_size": len(batches[batch_idx]),
                         "categorized": len(result) if result else 0
                     })
+                    emit_progress({
+                        "type": "categorization_progress",
+                        "completed_batches": completed_batches,
+                        "total_batches": len(batches),
+                        "batch_index": batch_idx + 1,
+                        "categorized": len(result) if result else 0,
+                    })
                 except Exception as e:
                     logger.error(f"Batch {batch_idx + 1} failed", {"error": str(e)})
-                    # Return empty categories for failed batch
                     batch_results[batch_idx] = []
-            
+                    completed_batches += 1
+                    emit_progress({
+                        "type": "categorization_progress",
+                        "completed_batches": completed_batches,
+                        "total_batches": len(batches),
+                        "batch_index": batch_idx + 1,
+                        "categorized": 0,
+                        "error": str(e),
+                    })
+
             # Combine results in order
             for result in batch_results:
                 if result:
@@ -264,19 +367,39 @@ def categorize_transactions_batch(
         all_results = []
         for idx, batch in enumerate(batches):
             try:
-                result = _categorize_batch_internal(batch, user_id, existing_rules)
+                result = categorize_single_batch(batch)
                 all_results.extend(result)
                 logger.info(f"Completed batch {idx + 1}/{len(batches)}", {
                     "batch_size": len(batch),
                     "categorized": len(result) if result else 0
                 })
+                emit_progress({
+                    "type": "categorization_progress",
+                    "completed_batches": idx + 1,
+                    "total_batches": len(batches),
+                    "batch_index": idx + 1,
+                    "categorized": len(result) if result else 0,
+                })
             except Exception as e:
                 logger.error(f"Batch {idx + 1} failed", {"error": str(e)})
-                # Continue with other batches
+                emit_progress({
+                    "type": "categorization_progress",
+                    "completed_batches": idx + 1,
+                    "total_batches": len(batches),
+                    "batch_index": idx + 1,
+                    "categorized": 0,
+                    "error": str(e),
+                })
     
     logger.info("Categorization complete", {
         "total_transactions": len(transactions),
         "categorized": len(all_results)
+    })
+
+    emit_progress({
+        "type": "categorization_complete",
+        "categorized": len(all_results),
+        "total_batches": len(batches),
     })
     
     return all_results
@@ -285,48 +408,20 @@ def categorize_transactions_batch(
 def _categorize_batch_internal(
     transactions: List[Dict],
     user_id: str,
-    existing_rules: List[Dict]
+    rules: List[CategorizationRule],
+    prompt_variant: str,
+    extra_instructions: str = "",
 ) -> List[Dict]:
-    """
-    Internal function to categorize a single batch of transactions.
-    """
-    categories_str = ", ".join(PREDEFINED_CATEGORIES)
-    
-    # Format existing rules
-    rules_str = ""
-    if existing_rules:
-        rules_str = "\nExisting categorization rules (apply these first):\n"
-        for rule in existing_rules:
-            pattern = rule.get('merchant_pattern', '')
-            category = rule.get('category', '')
-            rules_str += f"- If merchant matches '{pattern}', assign category '{category}'\n"
-    
-    # Format transactions
-    transactions_json = json.dumps(transactions, indent=2, default=str)
-    
-    prompt = f"""Categorize these bank transactions into the predefined categories.
-
-Available categories:
-{categories_str}
-{rules_str}
-
-Transactions to categorize:
-{transactions_json}
-
-For each transaction:
-1. First check if the merchant matches any existing rule above
-2. If no rule matches, analyze the description and merchant to determine the best category
-3. Assign exactly one category per transaction
-
-Return JSON array with this structure:
-[
-    {{"id": 1, "category": "Groceries"}},
-    {{"id": 2, "category": "Transportation"}},
-    ...
-]
-
-Each transaction must have an "id" field matching the transaction ID and a "category" field with one of the predefined categories.
-"""
+    """Internal function to categorize a single batch of transactions."""
+    prompt_name = "categorize_transactions.txt"
+    if prompt_variant == "retry":
+        prompt_name = "categorize_transactions_retry.txt"
+    prompt = _build_categorization_prompt(
+        transactions,
+        rules,
+        prompt_name,
+        extra_instructions=extra_instructions,
+    )
     
     try:
         response = call_cursor_agent(prompt, model="auto")
@@ -394,11 +489,14 @@ def build_categorization_prompt(
     
     rules_str = ""
     if existing_rules:
-        rules_str = "\nExisting categorization rules (apply these first):\n"
-        for rule in existing_rules:
-            pattern = rule.get('merchant_pattern', '')
-            category = rule.get('category', '')
-            rules_str += f"- If merchant matches '{pattern}', assign category '{category}'\n"
+        if isinstance(existing_rules[0], CategorizationRule):
+            rules_str = format_rules_for_prompt(existing_rules)  # type: ignore[arg-type]
+        else:
+            rules_str = "\nExisting categorization rules (apply these first):\n"
+            for rule in existing_rules:
+                pattern = rule.get('merchant_pattern', '') if isinstance(rule, dict) else ''
+                category = rule.get('category', '') if isinstance(rule, dict) else ''
+                rules_str += f"- If merchant matches '{pattern}', assign category '{category}'\n"
     
     transactions_json = json.dumps(transactions, indent=2, default=str)
     
@@ -427,56 +525,11 @@ def build_mcp_tool_context(user_id: Optional[str] = None) -> str:
         Formatted string with MCP tool information
     """
     mcp_base_url = os.getenv("BASE_URL", "http://localhost:8000")
-    
-    context = f"""
-You are a financial assistant for NumbyAI, a personal finance budgeting application.
-
-AVAILABLE MCP TOOLS:
-You have access to the following tools through the MCP server at {mcp_base_url}/mcp:
-
-1. **fetch_preferences** - Get user settings, categorization rules, or parsing instructions
-   - Use this FIRST when starting any finance conversation
-   - Parameters: preference_type (single or array), bank_name (optional), user_id (optional)
-   - Returns: User settings, categorization rules, or parsing instructions
-
-2. **save_preferences** - Save user settings, categorization rules, or parsing instructions
-   - Use when persisting user data
-   - Parameters: preferences (list), preference_type ("settings" | "categorization" | "parsing"), user_id (optional)
-
-3. **get_financial_data** - Get dashboard data and financial summaries
-   - Use when answering questions about spending, income, budgets, or showing dashboard
-   - Parameters: user_id, bank_name, month_year, categories, profile, tab (all optional)
-
-4. **save_statement_summary** - Save monthly statement summary
-   - Use when user provides a bank statement CSV/Excel file
-   - Parameters: category_summaries, bank_name, statement_net_flow, coverage_from, coverage_to, statement_insights, confirmation_text (optional), profile (optional), user_id (optional)
-
-5. **mutate_categories** - Adjust category totals after data is saved
-   - Use when reclassifying transactions or adjusting category amounts
-   - Parameters: operations (list), bank_name (optional), month_year (optional), user_id (optional)
-
-6. **save_budget** - Set or update budget targets
-   - Use when user wants to set budget limits
-   - Parameters: budgets (list), user_id (optional)
-
-CURRENT USER CONTEXT:
-- User ID: {user_id or "default"}
-
-HOW TO USE TOOLS:
-When you need to use a tool, describe what you want to do in your response. The system will interpret your intent and call the appropriate MCP tool on your behalf.
-
-For example:
-- "Let me check your current preferences" → will call fetch_preferences
-- "I'll save this categorization rule" → will call save_preferences
-- "Let me show you your spending breakdown" → will call get_financial_data
-
-IMPORTANT:
-- Always be helpful and conversational
-- When user asks about their finances, use get_financial_data to get real data
-- When user provides a statement file, guide them through the save_statement_summary workflow
-- Never make up financial data - always use tools to get real information
-"""
-    return context.strip()
+    return render_prompt(
+        load_prompt("mcp_tool_context.txt"),
+        mcp_base_url=mcp_base_url,
+        user_id=user_id or "default",
+    ).strip()
 
 
 def call_cursor_agent_chat(
@@ -682,80 +735,73 @@ Please respond helpfully to the user's message. If you need to use any MCP tools
         yield f"\n\n[Error: {str(e)}]"
 
 
-def learn_merchant_rules(transactions: List, db) -> List:
+def learn_merchant_rules(transactions: List, db, bank_name: Optional[str] = None) -> List:
     """
-    Learn new merchant categorization rules from transactions.
-    
+    Learn new merchant categorization preferences from transactions.
+
     Groups transactions by merchant + category, and if a merchant is categorized
-    the same way 3+ times, creates a CategorizationRule.
-    
+    the same way 3+ times, creates a CategorizationPreference rule.
+
     Args:
         transactions: List of Transaction objects (already categorized)
         db: Database session
-    
+        bank_name: Optional bank name for bank-specific rules
+
     Returns:
-        List of newly created CategorizationRule objects
+        List of newly created preference objects
     """
-    from app.database import CategorizationRule
+    from app.database import CategorizationPreference
     from collections import defaultdict
-    
-    # Group by merchant + category
+
     merchant_category_counts = defaultdict(int)
-    merchant_category_map = {}
-    
+
     for tx in transactions:
-        if not tx.merchant or not tx.category:
+        if not tx.merchant or not tx.category or tx.category == "Other":
             continue
-        
         key = (tx.merchant.lower(), tx.category)
         merchant_category_counts[key] += 1
-        merchant_category_map[key] = tx.category
-    
-    # Find merchants with 3+ consistent categorizations
-    new_rules = []
+
     user_id = transactions[0].user_id if transactions else None
-    
     if not user_id:
         return []
-    
+
+    new_rules = []
     for (merchant, category), count in merchant_category_counts.items():
-        if count >= 3:
-            # Check if rule already exists
-            existing = db.query(CategorizationRule).filter(
-                CategorizationRule.user_id == user_id,
-                CategorizationRule.merchant_pattern == merchant,
-                CategorizationRule.category == category
-            ).first()
-            
-            if not existing:
-                # Create new rule
-                rule = CategorizationRule(
-                    user_id=user_id,
-                    merchant_pattern=merchant,
-                    category=category,
-                    confidence_score=count,
-                    enabled=True
-                )
-                db.add(rule)
-                new_rules.append(rule)
-                logger.info("Learned new categorization rule", {
-                    "merchant": merchant,
-                    "category": category,
-                    "confidence": count
-                })
-            else:
-                # Update confidence score
-                existing.confidence_score = max(existing.confidence_score, count)
-                existing.updated_at = db.query(CategorizationRule).filter(
-                    CategorizationRule.id == existing.id
-                ).first().updated_at
-                logger.info("Updated categorization rule confidence", {
-                    "merchant": merchant,
-                    "category": category,
-                    "confidence": count
-                })
-    
+        if count < 3:
+            continue
+
+        existing_prefs = db.query(CategorizationPreference).filter(
+            CategorizationPreference.user_id == user_id,
+            CategorizationPreference.preference_type == "categorization",
+            CategorizationPreference.enabled.is_(True),
+            CategorizationPreference.bank_name == bank_name,
+        ).all()
+        if any(
+            isinstance(pref.rule, dict)
+            and pref.rule.get("merchant_pattern") == merchant
+            and pref.rule.get("category") == category
+            for pref in existing_prefs
+        ):
+            continue
+
+        rule = CategorizationPreference(
+            user_id=user_id,
+            name=f"auto:{merchant}",
+            rule={"merchant_pattern": merchant, "category": category},
+            bank_name=bank_name,
+            priority=0,
+            enabled=True,
+            preference_type="categorization",
+        )
+        db.add(rule)
+        new_rules.append(rule)
+        logger.info("Learned new categorization preference", {
+            "merchant": merchant,
+            "category": category,
+            "count": count,
+        })
+
     if new_rules:
         db.commit()
-    
+
     return new_rules

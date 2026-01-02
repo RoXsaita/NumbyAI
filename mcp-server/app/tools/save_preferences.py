@@ -5,6 +5,7 @@ from typing import Optional, Dict, Any, List, Literal
 from app.database import CategorizationPreference, SessionLocal, resolve_user_id
 from app.logger import create_logger, ErrorType
 from app.tools.category_helpers import PREDEFINED_CATEGORIES
+from app.services.categorization_rules import normalize_rule_input
 
 logger = create_logger("save_preferences")
 
@@ -43,6 +44,12 @@ def _validate_categorization_preference(pref: Dict[str, Any], index: int) -> Opt
     
     if rule["category"] not in PREDEFINED_CATEGORIES:
         return f"Preference at index {index}: Invalid category '{rule['category']}'. Must be one of: {', '.join(PREDEFINED_CATEGORIES)}"
+
+    has_pattern = any(
+        key in rule for key in ("merchant_pattern", "description_pattern", "pattern", "merchant", "description", "conditions")
+    )
+    if not has_pattern:
+        return f"Preference at index {index}: rule must include a pattern or conditions to match transactions"
     
     return None
 
@@ -270,7 +277,7 @@ async def save_preferences_handler(
                 rule_content = pref["instructions"]
                 priority = 0  # Parsing instructions don't use priority
             else:
-                rule_content = pref["rule"]
+                rule_content = normalize_rule_input(pref["rule"])
                 priority = pref.get("priority", 0)
 
             if preference_id:
@@ -621,4 +628,3 @@ async def save_categorization_preferences_handler(
         preference_type="categorization",
         user_id=user_id
     )
-

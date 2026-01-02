@@ -2,7 +2,7 @@
 UI Dashboard Tool - Category Summary Pivot Table Provider
 
 This module provides category summary data in pivot table format for the dashboard widget.
-It queries CategorySummary records and creates a pivot view with categories as rows and months as columns.
+It aggregates Transaction records and creates a pivot view with categories as rows and months as columns.
 
 The widget receives raw pivot data and decides how to visualize it.
 """
@@ -11,6 +11,9 @@ from collections import defaultdict
 from decimal import Decimal
 from typing import Any, Dict, Optional, List
 
+from sqlalchemy import func
+
+from app.config import settings
 from app.database import SessionLocal, CategorySummary, StatementInsight, StatementPeriod, Budget, CategorizationPreference, Transaction, resolve_user_id
 from datetime import date
 from app.logger import create_logger, ErrorType
@@ -44,62 +47,116 @@ def _decimal_to_float(value: Decimal | float | int | None) -> float:
     return float(value)
 
 
-def _aggregate_transactions_to_summaries(
-    transactions: List[Transaction],
-    user_id: str
-) -> List[CategorySummary]:
-    """
-    Aggregate transactions into CategorySummary-like objects for compatibility.
-    
-    This allows _build_dashboard_props to work with both Transaction and CategorySummary data.
-    
-    Args:
-        transactions: List of Transaction objects
-        user_id: User ID (for creating summary objects)
-    
-    Returns:
-        List of CategorySummary-like objects (using CategorySummary model structure)
-    """
-    from collections import defaultdict
-    
-    # Group by bank_name, month_year, category, profile
-    grouped = defaultdict(lambda: {
-        'amount': Decimal('0'),
-        'count': 0,
-        'currency': 'USD',
-        'profile': None
-    })
-    
-    for tx in transactions:
-        # Extract month_year from date
-        month_year = tx.date.strftime('%Y-%m')
-        key = (tx.bank_name, month_year, tx.category, tx.profile)
-        
-        grouped[key]['amount'] += Decimal(str(tx.amount))
-        grouped[key]['count'] += 1
-        grouped[key]['currency'] = tx.currency
-        grouped[key]['profile'] = tx.profile
-    
-    # Convert to CategorySummary-like objects
-    summaries = []
+class SummaryLike:
+    def __init__(
+        self,
+        summary_id: int,
+        bank_name: str,
+        month_year: str,
+        category: str,
+        amount: Decimal,
+        currency: str,
+        transaction_count: int,
+        profile: Optional[str],
+    ) -> None:
+        self.id = summary_id
+        self.bank_name = bank_name
+        self.month_year = month_year
+        self.category = category
+        self.amount = amount
+        self.currency = currency
+        self.transaction_count = transaction_count
+        self.profile = profile
+        self.insights = None
 
-    class SummaryLike:
-        def __init__(self, summary_id, bank_name, month_year, category, data):
-            self.id = summary_id
-            self.bank_name = bank_name
-            self.month_year = month_year
-            self.category = category
-            self.amount = data['amount']
-            self.currency = data['currency']
-            self.transaction_count = data['count']
-            self.profile = data['profile']
-            self.insights = None
 
-    for idx, ((bank_name, month_year, category, profile), data) in enumerate(grouped.items(), start=1):
-        summary = SummaryLike(idx, bank_name, month_year, category, data)
-        summaries.append(summary)
-    
-    return summaries
+def _month_year_expr():
+    if settings.database_url.startswith("sqlite"):
+        return func.strftime("%Y-%m", Transaction.date)
+    return func.to_char(Transaction.date, "YYYY-MM")
+
+
+def _fetch_transaction_summaries(
+    db: SessionLocal,
+    user_id: str,
+    bank_name: Optional[str] = None,
+    month_year: Optional[str] = None,
+    categories: Optional[List[str]] = None,
+    profile: Optional[str] = None,
+) -> tuple[List[SummaryLike], set[str], set[str], set[str]]:
+    """Fetch grouped transaction summaries without loading every row into memory."""
+    month_expr = _month_year_expr()
+    query = (
+        db.query(
+            Transaction.bank_name.label("bank_name"),
+            month_expr.label("month_year"),
+            Transaction.category.label("category"),
+            Transaction.profile.label("profile"),
+            Transaction.currency.label("currency"),
+            func.sum(Transaction.amount).label("amount"),
+            func.count(Transaction.id).label("transaction_count"),
+        )
+        .filter(Transaction.user_id == user_id)
+    )
+
+    if bank_name:
+        query = query.filter(Transaction.bank_name == bank_name)
+    if month_year:
+        year, month = map(int, month_year.split("-"))
+        from calendar import monthrange
+        last_day = monthrange(year, month)[1]
+        date_from = date(year, month, 1)
+        date_to = date(year, month, last_day)
+        query = query.filter(Transaction.date >= date_from, Transaction.date <= date_to)
+    if categories:
+        query = query.filter(Transaction.category.in_(categories))
+    if profile:
+        query = query.filter(Transaction.profile == profile)
+
+    query = query.group_by(
+        Transaction.bank_name,
+        month_expr,
+        Transaction.category,
+        Transaction.profile,
+        Transaction.currency,
+    )
+
+    rows = query.all()
+    summaries: List[SummaryLike] = []
+    months: set[str] = set()
+    banks: set[str] = set()
+    profiles: set[str] = set()
+
+    for idx, row in enumerate(rows, start=1):
+        month_value = row.month_year
+        bank_value = row.bank_name
+        category_value = row.category
+        currency_value = row.currency or "USD"
+        amount_value = row.amount if row.amount is not None else Decimal("0")
+        count_value = int(row.transaction_count or 0)
+        profile_value = row.profile
+
+        if month_value:
+            months.add(month_value)
+        if bank_value:
+            banks.add(bank_value)
+        if profile_value:
+            profiles.add(profile_value)
+
+        summaries.append(
+            SummaryLike(
+                idx,
+                bank_value,
+                month_value,
+                category_value,
+                amount_value,
+                currency_value,
+                count_value,
+                profile_value,
+            )
+        )
+
+    return summaries, months, banks, profiles
 
 
 # ============================================================================
@@ -621,73 +678,31 @@ def get_financial_data_handler(
         })
 
         # =====================================================================
-        # FETCH DATA: Try Transaction table first, fall back to CategorySummary
+        # FETCH DATA: Use Transaction table as canonical source
         # =====================================================================
-        
-        # Try to fetch from Transaction table first
-        all_transactions = db.query(Transaction).filter(
-            Transaction.user_id == resolved_user_id
-        ).all()
-        
-        # If we have transactions, aggregate them
-        if all_transactions:
+
+        all_summaries, all_months, all_banks, all_profiles = _fetch_transaction_summaries(
+            db,
+            resolved_user_id,
+        )
+
+        if all_summaries:
             logger.info("Using Transaction table for aggregation", {
-                "transaction_count": len(all_transactions)
+                "summary_count": len(all_summaries)
             })
-            all_summaries = _aggregate_transactions_to_summaries(all_transactions, resolved_user_id)
-            
-            # Apply filters to transactions before aggregation
-            filtered_transactions_query = db.query(Transaction).filter(
-                Transaction.user_id == resolved_user_id
-            )
-            if bank_name:
-                filtered_transactions_query = filtered_transactions_query.filter(Transaction.bank_name == bank_name)
-            if month_year:
-                # Filter by date range for the month
-                year, month = map(int, month_year.split('-'))
-                from calendar import monthrange
-                last_day = monthrange(year, month)[1]
-                date_from = date(year, month, 1)
-                date_to = date(year, month, last_day)
-                filtered_transactions_query = filtered_transactions_query.filter(
-                    Transaction.date >= date_from,
-                    Transaction.date <= date_to
-                )
-            if categories:
-                filtered_transactions_query = filtered_transactions_query.filter(Transaction.category.in_(categories))
-            if profile:
-                filtered_transactions_query = filtered_transactions_query.filter(Transaction.profile == profile)
-            
-            filtered_transactions = filtered_transactions_query.all()
-            filtered_summaries = _aggregate_transactions_to_summaries(filtered_transactions, resolved_user_id) if filtered_transactions else []
         else:
-            # Fall back to CategorySummary table
-            logger.info("Falling back to CategorySummary table", {
-                "user_id": resolved_user_id
-            })
-            all_summaries = db.query(CategorySummary).filter(
-                CategorySummary.user_id == resolved_user_id
-            ).all()
-            
-            # Fetch FILTERED summaries for structuredContent (AI payload)
-            filtered_query = db.query(CategorySummary).filter(
-                CategorySummary.user_id == resolved_user_id
-            )
-            if bank_name:
-                filtered_query = filtered_query.filter(CategorySummary.bank_name == bank_name)
-            if month_year:
-                filtered_query = filtered_query.filter(CategorySummary.month_year == month_year)
-            if categories:
-                filtered_query = filtered_query.filter(CategorySummary.category.in_(categories))
-            if profile:
-                filtered_query = filtered_query.filter(CategorySummary.profile == profile)
-            filtered_summaries = filtered_query.all()
+            logger.info("No transactions found for user", {"user_id": resolved_user_id})
+
+        filtered_summaries, _, _, _ = _fetch_transaction_summaries(
+            db,
+            resolved_user_id,
+            bank_name=bank_name,
+            month_year=month_year,
+            categories=categories,
+            profile=profile,
+        )
         
-        # Collect available profiles from all summaries
-        available_profiles = set()
-        for s in all_summaries:
-            if s.profile:
-                available_profiles.add(s.profile)
+        available_profiles = all_profiles
         
         # Fetch ALL periods (unfiltered) for widget
         all_periods = db.query(StatementPeriod).filter(
@@ -756,13 +771,8 @@ def get_financial_data_handler(
                 user_settings = UserSettings(**user_settings_dict)
 
         # Collect available months and banks from ALL summaries (for widget dropdowns)
-        available_months_set = set()
-        available_banks_set = set()
-        for s in all_summaries:
-            if s.month_year:
-                available_months_set.add(s.month_year)
-            if s.bank_name:
-                available_banks_set.add(s.bank_name)
+        available_months_set = set(all_months)
+        available_banks_set = set(all_banks)
         
         # Also include months that have budget data
         for category, month_budgets in budget_lookup.items():

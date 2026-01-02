@@ -46,6 +46,7 @@ class User(Base):
     id = UUIDColumn()
     email = Column(String(255), unique=True, nullable=False, index=True)
     name = Column(String(255))
+    password_hash = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=_utc_now, nullable=False)
 
     # Relationships

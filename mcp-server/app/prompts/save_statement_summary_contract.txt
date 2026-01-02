@@ -1,0 +1,15 @@
+SAVE_STATEMENT_SUMMARY workflow:
+1. IMMEDIATELY once statement + Net amount is received, fetch preferences for parsing and categorization
+2. Reverse engineer the statement to understand the format based on bank conventions and derive the net flow amount from the statement.
+3. Ensure you can view the full, non-truncated descriptions and vendor fields from the CSV before categorizing.
+4. CRITICAL: Assigning categories is the most complex step in the workflow. Break down the task into smaller steps and execute each step in detail.
+   - FIRST TIME SETUP: Assign every single transaction in the statement with categorization rules as your reference.
+   - USER WITH EXISTING CATEGORIZATION PREFERENCES: USE RULES AND APPLY FUZZY VLOOKUP TO THE STATEMENT THEN MANUALLY CATEGORIZE THE REST.
+5. Use Python fuzzy matching/regex to map vendors and descriptions to categories.
+6. Create pivot table using panda and numpy to aggregate the data by category as rows and months as columns. Include grand totals in the pivot table.
+7. Match grand total with the NET FLOW Provided by the user. If there is <2.5% difference, plug the difference into "Other" category and explain the discrepancy to the user.
+8. Before you run the save_statement_summary tool, check if the "Other" category represents more than 40% of the total. If yes, re-assess your categorization, and consider asking the user for additional details.
+9. Save the monthly summary via save_statement_summary
+10. Call get_financial_data to render the dashboard.
+11. Summarise the highest 3-4 transactions per category for the user (or very high level insight if its high volume transactions of a specific category)
+12. Confirm if the user is happy with the categorization preferences.

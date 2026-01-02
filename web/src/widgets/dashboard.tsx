@@ -2349,7 +2349,14 @@ interface CategorizationRule {
   id: string;
   name: string;
   bank_name: string | null;
-  rule: { pattern?: string; category?: string; [key: string]: any };
+  rule: {
+    merchant_pattern?: string;
+    description_pattern?: string;
+    pattern?: string;
+    category?: string;
+    conditions?: Record<string, any>;
+    [key: string]: any;
+  };
   priority: number;
 }
 
@@ -2366,8 +2373,20 @@ interface PreferencesData {
   parsing_banks: string[];
 }
 
-export const DashboardWidget: React.FC = () => {
-  const [localDashboardData, setLocalDashboardData] = useState<DashboardProps | null>(null);
+interface DashboardWidgetProps {
+  initialData?: DashboardProps | null;
+}
+
+export const DashboardWidget: React.FC<DashboardWidgetProps> = ({ initialData = null }) => {
+  const [localDashboardData, setLocalDashboardData] = useState<DashboardProps | null>(() => {
+    if (!initialData) return null;
+    const validated = dashboardPropsSchema.safeParse(initialData);
+    if (validated.success) {
+      return validated.data;
+    }
+    console.error('Dashboard initial data failed validation', validated.error);
+    return null;
+  });
   const { data, error, loading } = useDashboardData(localDashboardData);
   const theme = useTheme();
   const [showInsights, setShowInsights] = useState(true);  // Default to showing insights
@@ -2516,23 +2535,30 @@ export const DashboardWidget: React.FC = () => {
     }
   }, [data?.initial_filters?.profile]);
 
-  // Tab state - use default_tab from initial_filters, or default to 'journey'
+  const normalizeTab = (tab?: string | null): TabType => {
+    const mapped = tab === 'journey' ? 'overview' : tab;
+    const validTabs: TabType[] = ['overview', 'cashflow', 'trends', 'budget', 'details', 'preferences'];
+    return mapped && validTabs.includes(mapped as TabType) ? (mapped as TabType) : 'overview';
+  };
+
+  React.useEffect(() => {
+    if (!initialData) return;
+    const validated = dashboardPropsSchema.safeParse(initialData);
+    if (validated.success) {
+      setLocalDashboardData(validated.data);
+    } else {
+      console.error('Dashboard initial data failed validation', validated.error);
+    }
+  }, [initialData]);
+
+  // Tab state - use default_tab from initial_filters, or default to 'overview'
   const [activeTab, setActiveTab] = useState<TabType>(() => {
-    const defaultTab = data?.initial_filters?.default_tab;
-    // Validate that defaultTab is a valid TabType, otherwise default to 'journey'
-    const validTabs: TabType[] = ['journey', 'overview', 'cashflow', 'trends', 'budget', 'details', 'preferences'];
-    return (defaultTab && validTabs.includes(defaultTab as TabType)) ? (defaultTab as TabType) : 'journey';
+    return normalizeTab(data?.initial_filters?.default_tab);
   });
   
   // Update tab when default_tab changes in data
   React.useEffect(() => {
-    const defaultTab = data?.initial_filters?.default_tab;
-    if (defaultTab) {
-      const validTabs: TabType[] = ['journey', 'overview', 'cashflow', 'trends', 'budget', 'details', 'preferences'];
-      if (validTabs.includes(defaultTab as TabType)) {
-        setActiveTab(defaultTab as TabType);
-      }
-    }
+    setActiveTab(normalizeTab(data?.initial_filters?.default_tab));
   }, [data?.initial_filters?.default_tab]);
   
   // Inline editing state for the details table
@@ -2567,6 +2593,8 @@ export const DashboardWidget: React.FC = () => {
   const [transferToCategory, setTransferToCategory] = useState('');
   const [transferAmount, setTransferAmount] = useState('');
 
+  type TransactionSortKey = 'date' | 'description' | 'merchant' | 'amount' | 'category' | 'bank_name' | 'profile';
+
   // Transactions list state (Details tab)
   const [transactions, setTransactions] = useState<ApiTransaction[]>([]);
   const [transactionsLoading, setTransactionsLoading] = useState(false);
@@ -2574,6 +2602,7 @@ export const DashboardWidget: React.FC = () => {
   const [editingTransactionId, setEditingTransactionId] = useState<string | null>(null);
   const [editingTransactionCategory, setEditingTransactionCategory] = useState('');
   const [isSavingTransaction, setIsSavingTransaction] = useState(false);
+  const [transactionSort, setTransactionSort] = useState<{ key: TransactionSortKey; direction: 'asc' | 'desc' } | null>(null);
   
   
   const rootRef = useIntrinsicHeight();
@@ -2678,9 +2707,11 @@ export const DashboardWidget: React.FC = () => {
     };
   }, []);
 
-  const loadTransactions = React.useCallback(async () => {
+  const loadTransactions = React.useCallback(async (options?: { silent?: boolean }) => {
     setTransactionsLoading(true);
-    setTransactionsError(null);
+    if (!options?.silent) {
+      setTransactionsError(null);
+    }
     setEditingTransactionId(null);
     setEditingTransactionCategory('');
 
@@ -2712,7 +2743,9 @@ export const DashboardWidget: React.FC = () => {
       setTransactions(list);
     } catch (error) {
       console.error('Error loading transactions:', error);
-      setTransactionsError(error instanceof Error ? error.message : 'Failed to load transactions');
+      if (!options?.silent) {
+        setTransactionsError(error instanceof Error ? error.message : 'Failed to load transactions');
+      }
     } finally {
       setTransactionsLoading(false);
     }
@@ -2722,6 +2755,60 @@ export const DashboardWidget: React.FC = () => {
     if (activeTab !== 'details') return;
     loadTransactions();
   }, [activeTab, loadTransactions]);
+
+  const handleTransactionSort = (key: TransactionSortKey) => {
+    setTransactionSort((prev) => {
+      if (prev && prev.key === key) {
+        return { key, direction: prev.direction === 'asc' ? 'desc' : 'asc' };
+      }
+      return { key, direction: 'asc' };
+    });
+  };
+
+  const getSortIndicator = (key: TransactionSortKey) => {
+    if (!transactionSort || transactionSort.key !== key) return '';
+    return transactionSort.direction === 'asc' ? '▲' : '▼';
+  };
+
+  const sortedTransactions = useMemo(() => {
+    if (!transactionSort) return transactions;
+    const { key, direction } = transactionSort;
+    const multiplier = direction === 'asc' ? 1 : -1;
+    const safeText = (value?: string | null) => (value || '').toLowerCase();
+    const safeDate = (value: string) => {
+      const parsed = new Date(value).getTime();
+      return Number.isNaN(parsed) ? 0 : parsed;
+    };
+    return [...transactions].sort((a, b) => {
+      let comparison = 0;
+      switch (key) {
+        case 'amount':
+          comparison = a.amount - b.amount;
+          break;
+        case 'date':
+          comparison = safeDate(a.date) - safeDate(b.date);
+          break;
+        case 'description':
+          comparison = safeText(a.description).localeCompare(safeText(b.description));
+          break;
+        case 'merchant':
+          comparison = safeText(a.merchant).localeCompare(safeText(b.merchant));
+          break;
+        case 'category':
+          comparison = safeText(a.category).localeCompare(safeText(b.category));
+          break;
+        case 'bank_name':
+          comparison = safeText(a.bank_name).localeCompare(safeText(b.bank_name));
+          break;
+        case 'profile':
+          comparison = safeText(a.profile).localeCompare(safeText(b.profile));
+          break;
+        default:
+          comparison = 0;
+      }
+      return comparison * multiplier;
+    });
+  }, [transactions, transactionSort]);
 
   const startEditingTransaction = (tx: ApiTransaction) => {
     setEditingTransactionId(tx.id);
@@ -2753,9 +2840,14 @@ export const DashboardWidget: React.FC = () => {
         prev.map(tx => (tx.id === transactionId ? { ...tx, category: nextCategory } : tx))
       );
 
-      await refreshDashboardData();
-      await loadTransactions();
+      try {
+        await refreshDashboardData();
+      } catch (refreshError) {
+        console.warn('Dashboard refresh failed after transaction update:', refreshError);
+      }
+      await loadTransactions({ silent: true });
 
+      setTransactionsError(null);
       setChangeSummary([{
         message: 'Transaction category updated.',
         status: 'success',
@@ -2804,12 +2896,12 @@ export const DashboardWidget: React.FC = () => {
 
     setIsMutating(true);
     try {
-      // Convert operations to transaction updates
-      // For edit operations, we need to find transactions and update them
-      // For now, we'll refresh the dashboard after updates
-      
-      // TODO: Implement proper transaction updates based on operations
-      // For now, just refresh the dashboard
+      const result = await apiClient.mutateCategories({
+        operations,
+        bank_name: bankName || activeBankFilter,
+        month_year: monthYear || activeMonthFilter,
+      });
+
       await refreshDashboardData({
         bank_name: bankName || activeBankFilter,
         month_year: monthYear || activeMonthFilter,
@@ -2817,8 +2909,7 @@ export const DashboardWidget: React.FC = () => {
       setSelectedMonths([]);
       setSelectedBanks([]);
 
-      // Show success message
-      setChangeSummary([{
+      setChangeSummary(result.change_summary || [{
         message: 'Categories updated successfully',
         status: 'success',
         category: 'all',
@@ -3030,7 +3121,7 @@ export const DashboardWidget: React.FC = () => {
         preference_id: ruleId,
         name: editedRuleName,
         rule: {
-          pattern: editedRulePattern,
+          merchant_pattern: editedRulePattern,
           category: editedRuleCategory,
         },
       }], 'categorization');
@@ -3051,8 +3142,7 @@ export const DashboardWidget: React.FC = () => {
     
     setIsSavingPreference(true);
     try {
-      // TODO: Implement delete rule API endpoint
-      // For now, just refresh after the operation
+      await apiClient.deletePreference(ruleId);
       await loadPreferences();
     } catch (error) {
       console.error('Error deleting rule:', error);
@@ -3065,7 +3155,7 @@ export const DashboardWidget: React.FC = () => {
   const startEditingRule = (rule: CategorizationRule) => {
     setEditingRuleId(rule.id);
     setEditedRuleName(rule.name);
-    setEditedRulePattern(rule.rule?.pattern || '');
+    setEditedRulePattern(rule.rule?.merchant_pattern || rule.rule?.pattern || '');
     setEditedRuleCategory(rule.rule?.category || '');
   };
 
@@ -4881,29 +4971,146 @@ export const DashboardWidget: React.FC = () => {
                 </div>
               )}
 
-              <div style={{ overflowX: 'auto', maxHeight: 520, border: `1px solid ${colors.border.default}`, borderRadius: 8 }}>
+              <div style={{ overflow: 'auto', maxHeight: 520, border: `1px solid ${colors.border.default}`, borderRadius: 8 }}>
                 <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: TYPOGRAPHY.sizes.sm }}>
                   <thead>
                     <tr style={{ background: colors.bg.secondary }}>
-                      <th style={{ textAlign: 'left', padding: SPACING.sm, color: colors.text.secondary }}>Date</th>
-                      <th style={{ textAlign: 'left', padding: SPACING.sm, color: colors.text.secondary }}>Description</th>
-                      <th style={{ textAlign: 'left', padding: SPACING.sm, color: colors.text.secondary }}>Merchant</th>
-                      <th style={{ textAlign: 'right', padding: SPACING.sm, color: colors.text.secondary }}>Amount</th>
-                      <th style={{ textAlign: 'left', padding: SPACING.sm, color: colors.text.secondary }}>Category</th>
-                      <th style={{ textAlign: 'left', padding: SPACING.sm, color: colors.text.secondary }}>Bank</th>
-                      <th style={{ textAlign: 'left', padding: SPACING.sm, color: colors.text.secondary }}>Profile</th>
-                      <th style={{ textAlign: 'center', padding: SPACING.sm, color: colors.text.secondary }}>Actions</th>
+                      <th
+                        onClick={() => handleTransactionSort('date')}
+                        style={{
+                          textAlign: 'left',
+                          padding: SPACING.sm,
+                          color: colors.text.secondary,
+                          position: 'sticky',
+                          top: 0,
+                          background: colors.bg.secondary,
+                          zIndex: 2,
+                          cursor: 'pointer',
+                          userSelect: 'none',
+                        }}
+                      >
+                        Date {getSortIndicator('date')}
+                      </th>
+                      <th
+                        onClick={() => handleTransactionSort('description')}
+                        style={{
+                          textAlign: 'left',
+                          padding: SPACING.sm,
+                          color: colors.text.secondary,
+                          position: 'sticky',
+                          top: 0,
+                          background: colors.bg.secondary,
+                          zIndex: 2,
+                          cursor: 'pointer',
+                          userSelect: 'none',
+                        }}
+                      >
+                        Description {getSortIndicator('description')}
+                      </th>
+                      <th
+                        onClick={() => handleTransactionSort('merchant')}
+                        style={{
+                          textAlign: 'left',
+                          padding: SPACING.sm,
+                          color: colors.text.secondary,
+                          position: 'sticky',
+                          top: 0,
+                          background: colors.bg.secondary,
+                          zIndex: 2,
+                          cursor: 'pointer',
+                          userSelect: 'none',
+                        }}
+                      >
+                        Merchant {getSortIndicator('merchant')}
+                      </th>
+                      <th
+                        onClick={() => handleTransactionSort('amount')}
+                        style={{
+                          textAlign: 'right',
+                          padding: SPACING.sm,
+                          color: colors.text.secondary,
+                          position: 'sticky',
+                          top: 0,
+                          background: colors.bg.secondary,
+                          zIndex: 2,
+                          cursor: 'pointer',
+                          userSelect: 'none',
+                        }}
+                      >
+                        Amount {getSortIndicator('amount')}
+                      </th>
+                      <th
+                        onClick={() => handleTransactionSort('category')}
+                        style={{
+                          textAlign: 'left',
+                          padding: SPACING.sm,
+                          color: colors.text.secondary,
+                          position: 'sticky',
+                          top: 0,
+                          background: colors.bg.secondary,
+                          zIndex: 2,
+                          cursor: 'pointer',
+                          userSelect: 'none',
+                        }}
+                      >
+                        Category {getSortIndicator('category')}
+                      </th>
+                      <th
+                        onClick={() => handleTransactionSort('bank_name')}
+                        style={{
+                          textAlign: 'left',
+                          padding: SPACING.sm,
+                          color: colors.text.secondary,
+                          position: 'sticky',
+                          top: 0,
+                          background: colors.bg.secondary,
+                          zIndex: 2,
+                          cursor: 'pointer',
+                          userSelect: 'none',
+                        }}
+                      >
+                        Bank {getSortIndicator('bank_name')}
+                      </th>
+                      <th
+                        onClick={() => handleTransactionSort('profile')}
+                        style={{
+                          textAlign: 'left',
+                          padding: SPACING.sm,
+                          color: colors.text.secondary,
+                          position: 'sticky',
+                          top: 0,
+                          background: colors.bg.secondary,
+                          zIndex: 2,
+                          cursor: 'pointer',
+                          userSelect: 'none',
+                        }}
+                      >
+                        Profile {getSortIndicator('profile')}
+                      </th>
+                      <th
+                        style={{
+                          textAlign: 'center',
+                          padding: SPACING.sm,
+                          color: colors.text.secondary,
+                          position: 'sticky',
+                          top: 0,
+                          background: colors.bg.secondary,
+                          zIndex: 2,
+                        }}
+                      >
+                        Actions
+                      </th>
                     </tr>
                   </thead>
                   <tbody>
-                    {transactions.length === 0 && !transactionsLoading ? (
+                    {sortedTransactions.length === 0 && !transactionsLoading ? (
                       <tr>
                         <td colSpan={8} style={{ padding: SPACING.lg, textAlign: 'center', color: colors.text.secondary }}>
                           No transactions found for the current filters.
                         </td>
                       </tr>
                     ) : (
-                      transactions.map((tx, idx) => {
+                      sortedTransactions.map((tx, idx) => {
                         const isEditing = editingTransactionId === tx.id;
                         return (
                           <tr
@@ -4934,30 +5141,26 @@ export const DashboardWidget: React.FC = () => {
                             </td>
                             <td style={{ padding: SPACING.sm, minWidth: 160 }}>
                               {isEditing ? (
-                                <>
-                                  <input
-                                    type="text"
-                                    value={editingTransactionCategory}
-                                    list="transaction-category-options"
-                                    onChange={(e) => setEditingTransactionCategory(e.target.value)}
-                                    onKeyDown={(e) => {
-                                      if (e.key === 'Enter') {
-                                        handleSaveTransactionCategory(tx.id);
-                                      }
-                                      if (e.key === 'Escape') {
-                                        cancelEditingTransaction();
-                                      }
-                                    }}
-                                    style={{
-                                      width: '100%',
-                                      padding: `${SPACING.xs}px ${SPACING.sm}px`,
-                                      borderRadius: 4,
-                                      border: `1px solid ${colors.border.default}`,
-                                      background: colors.bg.primary,
-                                      color: colors.text.primary,
-                                    }}
-                                  />
-                                </>
+                                <select
+                                  value={editingTransactionCategory}
+                                  onChange={(e) => setEditingTransactionCategory(e.target.value)}
+                                  style={{
+                                    width: '100%',
+                                    padding: `${SPACING.xs}px ${SPACING.sm}px`,
+                                    borderRadius: 4,
+                                    border: `1px solid ${colors.border.default}`,
+                                    background: colors.bg.primary,
+                                    color: colors.text.primary,
+                                  }}
+                                >
+                                  {Array.from(new Set([tx.category, ...(currentPivot?.categories || [])]))
+                                    .filter(Boolean)
+                                    .map(category => (
+                                      <option key={category} value={category}>
+                                        {category}
+                                      </option>
+                                    ))}
+                                </select>
                               ) : (
                                 tx.category
                               )}
@@ -5026,11 +5229,6 @@ export const DashboardWidget: React.FC = () => {
                     )}
                   </tbody>
                 </table>
-                <datalist id="transaction-category-options">
-                  {(currentPivot?.categories || []).map(category => (
-                    <option key={category} value={category} />
-                  ))}
-                </datalist>
               </div>
             </Card>
 
@@ -5269,7 +5467,7 @@ export const DashboardWidget: React.FC = () => {
                                 Rule Name
                               </th>
                               <th style={{ textAlign: 'left', padding: SPACING.md, fontSize: TYPOGRAPHY.sizes.sm, fontWeight: TYPOGRAPHY.weights.semibold, color: colors.text.secondary }}>
-                                Pattern
+                                Merchant pattern
                               </th>
                               <th style={{ textAlign: 'left', padding: SPACING.md, fontSize: TYPOGRAPHY.sizes.sm, fontWeight: TYPOGRAPHY.weights.semibold, color: colors.text.secondary }}>
                                 Category
@@ -5386,7 +5584,7 @@ export const DashboardWidget: React.FC = () => {
                                       {rule.name}
                                     </td>
                                     <td style={{ padding: SPACING.md, fontSize: TYPOGRAPHY.sizes.sm, color: colors.text.primary, fontFamily: 'monospace' }}>
-                                      {rule.rule?.pattern || '-'}
+                                      {rule.rule?.merchant_pattern || rule.rule?.pattern || '-'}
                                     </td>
                                     <td style={{ padding: SPACING.md, fontSize: TYPOGRAPHY.sizes.sm, color: colors.text.primary }}>
                                       {rule.rule?.category || '-'}
@@ -5430,7 +5628,7 @@ export const DashboardWidget: React.FC = () => {
                       color: colors.text.secondary,
                     }}
                   >
-                    <strong>How categorization rules work:</strong> When you upload statements, the AI uses these rules to automatically categorize transactions. Rules are learned over time as you confirm categorizations. Global rules apply to all banks; bank-specific rules only apply to that bank's statements.
+                    <strong>How categorization rules work:</strong> When you upload statements, the AI uses these rules to automatically categorize transactions. Patterns match against merchant or description text. Rules are learned over time as you confirm categorizations. Global rules apply to all banks; bank-specific rules only apply to that bank's statements.
                   </div>
                 </div>
               )}

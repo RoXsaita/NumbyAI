@@ -12,6 +12,7 @@ from app.database import (
 )
 from app.logger import create_logger, ErrorType
 from app.tools.category_helpers import PREDEFINED_CATEGORIES
+from app.prompts import load_prompt
 from app.tools.redaction import redact_insights, validate_no_sensitive_data
 
 # Create logger for this module
@@ -25,23 +26,7 @@ SETTINGS_PREFERENCE_NAME = "user_settings"
 RECONCILIATION_TOLERANCE_PCT = 0.025  # 2.5% tolerance for category sum vs statement net flow
 MIN_RECONCILIATION_THRESHOLD = 1.0    # Minimum absolute threshold to avoid div-by-zero edge cases
 
-SAVE_STATEMENT_SUMMARY_WORKFLOW_STEPS = (
-    "SAVE_STATEMENT_SUMMARY workflow:\n"
-    "1. IMMEDIATELY once statement + Net amount is received, fetch preferences for parsing and categorization\n"
-    "2. Reverse engineer the statement to understand the format based on bank conventions and derive the net flow amount from the statement.\n"
-    "3. Ensure you can view the full, non-truncated descriptions and vendor fields from the CSV before categorizing.\n"
-    "4. CRITICAL: Assigning categories is the most complex step in the workflow. Break down the task into smaller steps and execute each step in detail.\n"
-    "   - FIRST TIME SETUP: Assign every single transaction in the statement with categorization rules as your reference.\n"
-    "   - USER WITH EXISTING CATEGORIZATION PREFERENCES: USE RULES AND APPLY FUZZY VLOOKUP TO THE STATEMENT THEN MANUALLY CATEGORIZE THE REST.\n"
-    "5. Use Python fuzzy matching/regex to map vendors and descriptions to categories.\n"
-    "6. Create pivot table using panda and numpy to aggregate the data by category as rows and months as columns. Include grand totals in the pivot table.\n"
-    "7. Match grand total with the NET FLOW Provided by the user. If there is <2.5% difference, plug the difference into \"Other\" category and explain the discrepancy to the user.\n"
-    "8. Before you run the save_statement_summary tool, check if the 'other' category represents more than 40% of the total. If yes, re-assess your categorization, and consider asking the user for additional details.\n"
-    "9. Save the monthly summary via save_statement_summary\n"
-    "10. Call get_financial_data to render the dashboard.\n"
-    "11. Summarise the highest 3-4 transactinos per category for the user (or very high lvl insight if its high volume transactions of a specific category)\n"
-    "12. Confirm if the user is happy with the categorization preferences."
-)
+SAVE_STATEMENT_SUMMARY_WORKFLOW_STEPS = load_prompt("save_statement_summary_contract.txt").strip()
 
 SAVE_STATEMENT_SUMMARY_CONTRACT_MESSAGE = (
     "Please follow the instructions in the save_statement_summary tool contracts as follows:\n\n"
